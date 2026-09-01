@@ -25,7 +25,7 @@ param(
 )
 
 # ---- configuration -------------------------------------------------------
-$BulbIp     = '192.168.0.104'
+$BulbIp     = '192.168.0.103'
 $BulbPort   = 9999
 $Brightness = 60          # 1-100. Lower this if the room feels flooded.
 $ConnectMs  = 1000        # give up quietly if the bulb is slow or offline
