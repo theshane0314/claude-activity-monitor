@@ -48,10 +48,11 @@ address moves.
 To drive different hardware (a USB tower light, an addressable LED strip, a Home
 Assistant entity), replace `Set-Light`. Nothing else in the file changes.
 
-**Flashing.** On a state *change* the bulb pulses the new colour 3 times, so the change
-is noticeable when other lights are on. A repeat of the current state does nothing.
-Tune with `$FlashCount` (0 disables) and `$FlashMs`. A change costs about 1s; a repeat
-costs 4ms.
+**Flashing (optional, off by default).** Set `$FlashCount` above 0 and the bulb pulses
+the new colour that many times on a state *change*, which helps if the bulb shares a
+fixture with a brighter room light. It is off because it gets annoying fast once the
+status light has a bulb to itself. Off, a change costs ~60ms; at 3 pulses, ~1s. Either
+way a repeat of the current state costs 4ms and touches nothing.
 
 **Design notes.** It caches the last state and skips the network entirely when the
 colour is unchanged, because `PreToolUse` and `PostToolUse` fire constantly. It gives

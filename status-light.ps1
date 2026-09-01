@@ -27,10 +27,10 @@ param(
 # ---- configuration -------------------------------------------------------
 $BulbIp     = '192.168.0.103'
 $BulbPort   = 9999
-$Brightness = 60          # 1-100. Lower this if the room feels flooded.
+$Brightness = 100         # 1-100. Lower this if the room feels flooded.
 $ConnectMs  = 1000        # give up quietly if the bulb is slow or offline
 
-$FlashCount = 3           # pulses on a state change. 0 disables flashing.
+$FlashCount = 0           # pulses on a state change. 0 disables flashing.
 $FlashMs    = 130         # on/off duration per phase, milliseconds
 
 # Hue/saturation per state. Set green to @{ hue = 0; sat = 0 } for warm white
@@ -142,7 +142,7 @@ try {
     else {
         $color = Get-ColorPayload -State $State
         $off = Get-OffPayload
-        $payloads.Add($color); $delays.Add($FlashMs)
+        $payloads.Add($color); $delays.Add($(if ($FlashCount -gt 0) { $FlashMs } else { 0 }))
         for ($i = 0; $i -lt $FlashCount; $i++) {
             $payloads.Add($off);   $delays.Add($FlashMs)
             $payloads.Add($color); $delays.Add($(if ($i -lt ($FlashCount - 1)) { $FlashMs } else { 0 }))
