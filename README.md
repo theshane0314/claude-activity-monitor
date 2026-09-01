@@ -48,11 +48,27 @@ address moves.
 To drive different hardware (a USB tower light, an addressable LED strip, a Home
 Assistant entity), replace `Set-Light`. Nothing else in the file changes.
 
+**Flashing.** On a state *change* the bulb pulses the new colour 3 times, so the change
+is noticeable when other lights are on. A repeat of the current state does nothing.
+Tune with `$FlashCount` (0 disables) and `$FlashMs`. A change costs about 1s; a repeat
+costs 4ms.
+
 **Design notes.** It caches the last state and skips the network entirely when the
 colour is unchanged, because `PreToolUse` and `PostToolUse` fire constantly. It gives
 up quietly after a 1s connect timeout and never throws, so an offline bulb can't break
 a hook. Set `green` to `@{ hue = 0; sat = 0 }` if you would rather idle be warm white
 and keep the bulb usable as a room light.
+
+Two things that are easy to get wrong and are worth keeping:
+
+- **The whole sequence runs over one connection, reading each reply before sending
+  the next command.** Closing the socket straight after a write races the device, and
+  the last command gets silently dropped — the bulb ends up on the previous colour
+  while the script reports success.
+- **The cache is claimed before the flash, not after.** `PreToolUse` and `PostToolUse`
+  both ask for yellow milliseconds apart; claiming afterwards lets the second call see
+  a stale cache and flash on top of the first. If the bulb turns out to be unreachable
+  the claim is rolled back, so the next hook retries.
 
 **Wiring.** Register it in `~/.claude/settings.json` alongside the other hooks, passing
 the colour as the final argument:
