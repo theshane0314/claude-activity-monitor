@@ -36,7 +36,7 @@ Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Wind
 | 🟡 yellow | running | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` |
 | 🟢 green | finished, ready for a new task | `Stop`, `SessionStart`, `SessionEnd` |
 
-Usage: `status-light.ps1 <red|yellow|green|off>`
+Usage: `status-light.ps1 <red|yellow|green|off|status>`
 
 **Multiple sessions.** The colour is the worst state across every live session, not
 whatever the last hook asked for: red beats yellow beats green. One session hitting
@@ -48,11 +48,60 @@ keyed by its session id, written from the `session_id` on the hook's stdin JSON;
 closed, crash, reboot) would pin the light yellow forever, so a slot untouched for
 `$StaleMinutes` (30) is swept. Keep that above the longest gap between two hook events
 in a working session: a foreground `Bash` call can hold for ten minutes, with model
-thinking either side of it. If the light is ever stuck, delete that directory.
+thinking either side of it. If the light is ever stuck, run `status` (below), and
+delete that directory if you need a hard reset.
+
+**Backgrounded commands count as working.** Hooks only fire around tool calls, so a
+session that launches a test suite with `run_in_background` and then ends its turn
+fires `Stop` while the suite is still running. Slots alone would call that green. So
+on the way to green (and only then, since the answer is only ever needed there) the
+script asks whether any backgrounded command is still alive.
+
+The signal is a lock, not a guess. Claude Code gives every backgrounded command a task
+id and streams its output to
+`%TEMP%\claude\<project>\<session>\tasks\<id>.output`, holding that file open for as
+long as the command runs, so an output file that is still locked for writing **is** a
+running task. Nothing else available answers it: a backgrounded command is orphaned as
+soon as its launching shell exits, so its parent chain no longer reaches the session,
+and picking real work out of the idle session shell, the MCP servers and the hook
+processes would take a name-and-age guess that goes stale the first time any of them
+changes. Every session's task directory is scanned, not just the ones holding a slot,
+because a task outlives both the turn that started it and the slot's staleness sweep.
+It costs about 200 ms over a few hundred files.
+
+When the command finishes the lock clears, and the next hook from any session pushes
+green. Normally that is immediate, since finishing a background task wakes its session.
+If nothing wakes it the light stays yellow until something does, which is the right way
+round to be wrong.
+
+**`status-light.ps1 status`** explains the current colour and needs no session: every
+session and what it last asked for (flagging stale slots), every running task, the
+combined answer, the cached colour, and what the bulb itself reports it is showing.
+That last line is the one that catches a silent failure, since the cache is only a
+belief about a device that can be offline or have handed its address to something else.
+
+```
+sessions:
+  8efcd7c6  yellow   last hook 0.0 min ago
+  cfb43f8d  green    last hook 12.1 min ago
+running tasks:
+  (none)
+aggregate : yellow
+cache     : yellow
+bulb      : Office 2 is showing yellow
+```
 
 Run by hand with no stdin there is no session to attribute the colour to, so the
 argument is forced onto the bulb directly; `off` also forgets every session, so the
 next hook event rebuilds the picture from scratch.
+
+**Trace.** Every invocation appends its decision (colour asked for, session, hook, the
+slots it saw, the aggregate it chose, and any exception it swallowed) to
+`%TEMP%\claude-status-light-trace.log`, rotated at 1 MB. Set `$TraceFile = ''` to turn
+it off. It is worth its keep: the light showing the wrong colour is otherwise
+unfalsifiable after the fact, because nothing else records what the sessions looked
+like at the time. Keep it in `%TEMP%` — **hook processes cannot write under
+`%LOCALAPPDATA%`**, which is also why `activity.jsonl` stops updating (see Notes).
 
 **Backend.** Ships with a TP-Link Kasa driver (tested on a KL125) speaking the legacy
 autokey-XOR protocol directly over TCP 9999. No Python, no library, no cloud, no
@@ -113,3 +162,23 @@ Hook config is picked up live; no restart needed.
 - Colors: amber = running/tool call, green = done/output, red = fail/denied, blue = your prompts, purple = alerts/permission asks, cyan = agents, orange = detached, gray = lifecycle.
 - pause = stops autoscroll everywhere; clear = wipes the feed list (log file untouched).
 - To disable logging: remove the `hooks` block from `~/.claude/settings.json`.
+
+## Known issue: the event feed is not being written
+
+**`hook-logger.ps1` is failing silently and `activity.jsonl` has not been written since
+2026-09-01 18:00**, so the activity tab and the session tabs show nothing newer than
+that. Sessions have run since; the hooks fire (the status light reacts to them), but
+the append does not land.
+
+What is established: a hook-spawned PowerShell process cannot write under
+`%LOCALAPPDATA%\ClaudeActivityMonitor\`, while the identical call from an interactive
+shell writes there fine. That was found by pointing the status light's own trace file
+at that directory (nothing appeared, across many invocations) and then moving it to
+`%TEMP%` (every invocation appeared immediately). `hook-logger.ps1` writes only to
+`%LOCALAPPDATA%`, and it swallows every error via `trap { exit 0 }`, so it has been
+failing invisibly.
+
+Not yet established: why. Candidates are the sandbox Claude Code spawns hooks inside,
+an ACL on the directory, or controlled-folder-access blocking writes by an unrecognised
+process. The fix is likely to be moving the log under `%TEMP%` like the trace, but the
+cause should be pinned first, since the monitor app reads that path too.

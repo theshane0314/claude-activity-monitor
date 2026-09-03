@@ -9,6 +9,11 @@
 # while another is mid-tool leaves the light yellow, which is the whole point.
 # Green has to mean "nothing is running anywhere".
 #
+# "Working" includes backgrounded commands. A session that launches a test suite
+# with run_in_background and then ends its turn fires Stop, but the suite is
+# still running and the light must stay yellow until it finishes. See
+# Get-RunningTasks for how that is detected.
+#
 # On a state CHANGE the bulb flashes the new colour a few times, so the change
 # is noticeable when other lights are on. A repeat of the current state does
 # nothing at all (see the cache note below).
@@ -21,15 +26,19 @@
 #
 # To swap hardware, replace Send-Kasa and the two payload builders.
 #
-# Usage: status-light.ps1 <red|yellow|green|off>
+# Usage: status-light.ps1 <red|yellow|green|off|status>
 #
 # Run from a hook, the event JSON arrives on stdin and the colour is recorded
 # against that session's id. Run by hand with no stdin, the colour is forced
 # onto the bulb directly, ignoring what the sessions want.
+#
+# `status` explains the current colour: every session and what it last asked
+# for, every running background task, the combined answer, and what the bulb
+# itself reports it is showing.
 
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('red', 'yellow', 'green', 'off')]
+    [ValidateSet('red', 'yellow', 'green', 'off', 'status')]
     [string]$State
 )
 
@@ -62,7 +71,26 @@ $Priority = @{ green = 1; yellow = 2; red = 3 }
 
 $CacheFile = Join-Path $env:TEMP 'claude-status-light.state'   # colour on the bulb
 $StateDir  = Join-Path $env:TEMP 'claude-status-light'         # one file per session
+
+# Every decision this script makes, appended per invocation. Worth its keep:
+# the light showing the wrong colour is otherwise unfalsifiable after the fact,
+# since nothing else records what the sessions looked like at the time. Set to
+# '' to disable. Do NOT move it under %LOCALAPPDATA% -- hook processes cannot
+# write there (see the note in the README).
+$TraceFile = Join-Path $env:TEMP 'claude-status-light-trace.log'
+$TraceMaxKB = 1024
 # --------------------------------------------------------------------------
+
+function Write-Trace {
+    param([string]$Msg)
+    if ([string]::IsNullOrEmpty($TraceFile)) { return }
+    try {
+        $fi = Get-Item -LiteralPath $TraceFile -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -gt ($TraceMaxKB * 1KB)) { Remove-Item -LiteralPath $TraceFile -Force -ErrorAction SilentlyContinue }
+        [System.IO.File]::AppendAllText($TraceFile, ((Get-Date).ToString('HH:mm:ss.fff') + "  pid=$PID  " + $Msg + "`n"))
+    }
+    catch { }
+}
 
 function ConvertTo-KasaFrame {
     param([string]$Payload)
@@ -143,13 +171,75 @@ function Get-OffPayload {
     '{"smartlife.iot.smartbulb.lightingservice":{"transition_light_state":{"ignore_default":1,"on_off":0,"transition_period":0}}}'
 }
 
+function ConvertFrom-KasaFrame {
+    param([byte[]]$Buf)
+    $key = 171
+    $out = New-Object byte[] $Buf.Length
+    for ($i = 0; $i -lt $Buf.Length; $i++) { $out[$i] = $Buf[$i] -bxor $key; $key = $Buf[$i] }
+    return [Text.Encoding]::UTF8.GetString($out)
+}
+
+function Show-Status {
+    # Answers "why is the light that colour" without needing a debugging session.
+    "sessions:"
+    $any = $false
+    foreach ($f in @(Get-ChildItem -LiteralPath $StateDir -Filter '*.state' -File -ErrorAction SilentlyContinue)) {
+        $any = $true
+        $age = ((Get-Date) - $f.LastWriteTime).TotalMinutes
+        $stale = if ($age -gt $StaleMinutes) { '  STALE, ignored' } else { '' }
+        "  {0}  {1,-7}  last hook {2:n1} min ago{3}" -f $f.BaseName.Substring(0, [Math]::Min(8, $f.BaseName.Length)), (Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue), $age, $stale
+    }
+    if (-not $any) { "  (none)" }
+
+    "running tasks:"
+    $tasks = @(Get-RunningTasks)
+    if ($tasks.Count -eq 0) { "  (none)" } else { $tasks | ForEach-Object { "  $_" } }
+
+    "aggregate : " + (Get-AggregateState)
+    "cache     : " + $(if (Test-Path $CacheFile) { (Get-Content $CacheFile -Raw -ErrorAction SilentlyContinue).Trim() } else { '(none)' })
+
+    # Ask the bulb what it is actually showing. The cache is only a belief, and
+    # a silent failure (bulb offline, address reused by another device) shows up
+    # here as the two disagreeing.
+    $client = New-Object Net.Sockets.TcpClient
+    try {
+        $ar = $client.BeginConnect($BulbIp, $BulbPort, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($ConnectMs)) { "bulb      : UNREACHABLE at $BulbIp`:$BulbPort"; return }
+        $client.EndConnect($ar)
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = 2000
+        $frame = ConvertTo-KasaFrame -Payload '{"system":{"get_sysinfo":{}}}'
+        $stream.Write($frame, 0, $frame.Length)
+        $stream.Flush()
+
+        $hdr = New-Object byte[] 4; $got = 0
+        while ($got -lt 4) { $n = $stream.Read($hdr, $got, 4 - $got); if ($n -le 0) { break }; $got += $n }
+        [Array]::Reverse($hdr)
+        $rlen = [BitConverter]::ToInt32($hdr, 0)
+        $rbuf = New-Object byte[] $rlen; $got = 0
+        while ($got -lt $rlen) { $n = $stream.Read($rbuf, $got, $rlen - $got); if ($n -le 0) { break }; $got += $n }
+        $info = (ConvertFrom-Json (ConvertFrom-KasaFrame -Buf $rbuf)).system.get_sysinfo
+        $ls = $info.light_state
+        if ($ls.on_off -eq 0) { "bulb      : {0} is OFF" -f $info.alias }
+        else {
+            $name = 'hue ' + $ls.hue
+            foreach ($k in $Colors.Keys) { if ($Colors[$k].hue -eq $ls.hue -and $Colors[$k].sat -eq $ls.saturation) { $name = $k } }
+            if ($ls.saturation -eq 0) { $name = 'white' }
+            "bulb      : {0} is showing {1}" -f $info.alias, $name
+        }
+    }
+    catch { "bulb      : error talking to $BulbIp - $($_.Exception.Message)" }
+    finally { $client.Close() }
+}
+
 function Get-HookEvent {
     # Hooks deliver their event JSON on stdin. A manual run has no stdin at all,
     # and reading it would block on the console, so check before reading.
-    if (-not [Console]::IsInputRedirected) { return $null }
+    if (-not [Console]::IsInputRedirected) { Write-Trace 'stdin NOT redirected'; return $null }
     $raw = [Console]::In.ReadToEnd()
-    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-    try { return (ConvertFrom-Json $raw) } catch { return $null }
+    if ([string]::IsNullOrWhiteSpace($raw)) { Write-Trace 'stdin empty'; return $null }
+    Write-Trace ('stdin len=' + $raw.Length)
+    try { return (ConvertFrom-Json $raw) } catch { Write-Trace 'json parse FAILED'; return $null }
 }
 
 function Get-SessionKey {
@@ -180,6 +270,57 @@ function Set-SessionState {
     Set-Content -LiteralPath $f -Value $Want -NoNewline
 }
 
+function Get-RunningTasks {
+    # Claude Code gives every backgrounded command a task id and streams its
+    # output to %TEMP%\claude\<project>\<session>\tasks\<id>.output, holding that
+    # file open for as long as the command runs. So a task output file that is
+    # still locked for writing IS a running task.
+    #
+    # This is the only reliable signal available. The process table cannot answer
+    # it: a backgrounded command is orphaned the moment its launching shell
+    # exits, so its parent chain no longer reaches the session, and telling real
+    # work apart from the idle session shell, the MCP servers and the hook
+    # processes would need a name-and-age guess that goes stale the first time
+    # any of them changes.
+    #
+    # Every session is scanned, not just the ones with a slot, because a task
+    # outlives the turn that started it and can outlive the slot's staleness
+    # sweep. Roughly 200 ms over a few hundred files, and only ever paid on the
+    # transition to green.
+    param([switch]$StopAtFirst)
+
+    $found = New-Object System.Collections.Generic.List[string]
+    $root = Join-Path $env:TEMP 'claude'
+    if (-not (Test-Path -LiteralPath $root)) { return $found }
+
+    foreach ($proj in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($sess in @(Get-ChildItem -LiteralPath $proj.FullName -Directory -ErrorAction SilentlyContinue)) {
+            $tasks = Join-Path $sess.FullName 'tasks'
+            if (-not (Test-Path -LiteralPath $tasks)) { continue }
+            foreach ($f in @(Get-ChildItem -LiteralPath $tasks -Filter '*.output' -File -ErrorAction SilentlyContinue)) {
+                $locked = $false
+                try {
+                    $fs = [System.IO.File]::Open($f.FullName, 'Open', 'ReadWrite', 'None')
+                    $fs.Close()
+                }
+                # A file that vanished or cannot be reached is not a running task.
+                # Only a sharing violation means someone else still holds it.
+                catch [System.IO.FileNotFoundException] { }
+                catch [System.IO.DirectoryNotFoundException] { }
+                catch [System.UnauthorizedAccessException] { }
+                catch [System.IO.IOException] { $locked = $true }
+                catch { }
+
+                if ($locked) {
+                    $found.Add(($sess.Name.Substring(0, [Math]::Min(8, $sess.Name.Length))) + '/' + $f.BaseName)
+                    if ($StopAtFirst) { return $found }
+                }
+            }
+        }
+    }
+    return $found
+}
+
 function Get-AggregateState {
     # Worst state across every session still checking in. No sessions at all
     # means nothing is running, which is green.
@@ -197,6 +338,11 @@ function Get-AggregateState {
         if (-not $Priority.ContainsKey($s)) { continue }
         if ($Priority[$s] -gt $Priority[$best]) { $best = $s }
     }
+
+    # Every agent is idle, but a backgrounded command it launched may still be
+    # running. Only worth asking here, on the way to green.
+    if ($best -eq 'green' -and @(Get-RunningTasks -StopAtFirst).Count -gt 0) { $best = 'yellow' }
+
     return $best
 }
 
@@ -245,11 +391,15 @@ function Set-Light {
     }
 }
 
+if ($State -eq 'status') { Show-Status; exit 0 }
+
 try {
+    Write-Trace ("ENTER state=$State temp=$env:TEMP")
     $hookEvent = Get-HookEvent
     $key = Get-SessionKey -Event $hookEvent
     $hookName = ''
     if ($null -ne $hookEvent) { $hookName = [string]$hookEvent.hook_event_name }
+    Write-Trace ("key=$key hook=$hookName")
 
     # Recording, combining and pushing has to be one critical section. Sessions
     # fire hooks concurrently, and two interleaved runs can otherwise push their
@@ -271,7 +421,9 @@ try {
         }
         else {
             Set-SessionState -Key $key -Want $State -Ended ($hookName -eq 'SessionEnd')
-            Set-Light -Want (Get-AggregateState)
+            $agg = Get-AggregateState
+            Write-Trace ("slots=[" + (($(Get-ChildItem -LiteralPath $StateDir -Filter '*.state' -File -EA SilentlyContinue) | ForEach-Object { $_.BaseName.Substring(0, [Math]::Min(8, $_.BaseName.Length)) + '=' + (Get-Content $_.FullName -Raw -EA SilentlyContinue) }) -join ' ') + "] agg=$agg")
+            Set-Light -Want $agg
         }
     }
     finally {
@@ -280,7 +432,10 @@ try {
     }
 }
 catch {
-    # A status light must never break a hook.
+    # A status light must never break a hook. But a swallowed error leaves the
+    # bulb on the wrong colour with nothing to show for it, so it gets recorded
+    # before it is dropped.
+    Write-Trace ('EXCEPTION line ' + $_.InvocationInfo.ScriptLineNumber + ': ' + $_.Exception.Message)
 }
 
 exit 0
