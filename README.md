@@ -38,6 +38,22 @@ Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Wind
 
 Usage: `status-light.ps1 <red|yellow|green|off>`
 
+**Multiple sessions.** The colour is the worst state across every live session, not
+whatever the last hook asked for: red beats yellow beats green. One session hitting
+`Stop` while another is mid-tool leaves the light yellow, and so does a fresh
+`SessionStart` landing next to a session that is working. Green means nothing is
+running anywhere. Each session gets a slot file under `%TEMP%\claude-status-light\`
+keyed by its session id, written from the `session_id` on the hook's stdin JSON;
+`SessionEnd` deletes the slot. A session that dies without firing `SessionEnd` (window
+closed, crash, reboot) would pin the light yellow forever, so a slot untouched for
+`$StaleMinutes` (30) is swept. Keep that above the longest gap between two hook events
+in a working session: a foreground `Bash` call can hold for ten minutes, with model
+thinking either side of it. If the light is ever stuck, delete that directory.
+
+Run by hand with no stdin there is no session to attribute the colour to, so the
+argument is forced onto the bulb directly; `off` also forgets every session, so the
+next hook event rebuilds the picture from scratch.
+
 **Backend.** Ships with a TP-Link Kasa driver (tested on a KL125) speaking the legacy
 autokey-XOR protocol directly over TCP 9999. No Python, no library, no cloud, no
 credentials, no dependencies at all — just a socket write. Typical call is 15-150 ms,
@@ -70,6 +86,10 @@ Two things that are easy to get wrong and are worth keeping:
   both ask for yellow milliseconds apart; claiming afterwards lets the second call see
   a stale cache and flash on top of the first. If the bulb turns out to be unreachable
   the claim is rolled back, so the next hook retries.
+- **Recording the session, combining the sessions and pushing the bulb are one
+  critical section**, held under a named mutex. Sessions fire hooks concurrently, so
+  two interleaved runs can otherwise read each other's half-written state and leave
+  the bulb showing the loser.
 
 **Wiring.** Register it in `~/.claude/settings.json` alongside the other hooks, passing
 the colour as the final argument:
