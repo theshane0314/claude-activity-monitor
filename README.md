@@ -28,7 +28,7 @@ Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Wind
 
 ## Status light
 
-`status-light.ps1` turns a smart bulb into a traffic light for Claude Code:
+`status-light.ps1` turns a smart light into a traffic light for Claude Code:
 
 | Colour | Meaning | Hook events |
 |---|---|---|
@@ -38,11 +38,19 @@ Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Wind
 
 Usage: `status-light.ps1 <red|yellow|green|off|status>`
 
-**Multiple sessions.** The colour is the worst state across every live session, not
-whatever the last hook asked for: red beats yellow beats green. One session hitting
-`Stop` while another is mid-tool leaves the light yellow, and so does a fresh
-`SessionStart` landing next to a session that is working. Green means nothing is
-running anywhere. Each session gets a slot file under `%TEMP%\claude-status-light\`
+**Multiple sessions.** On the cube backend every live session gets its own block of
+the panel, side by side, so nothing is hidden behind an aggregate. The cube is a 20x5
+matrix: one session fills all 20 columns, two take 10 and 9, three take 6/6/6, each
+separated by a dark column so the blocks can be counted at a glance. Separators are
+dropped wholesale once they stop fitting (past 10 sessions), and past 20 the columns
+run out and blocks are allocated per pixel instead, so all 100 LEDs can carry 100
+sessions at once.
+
+A worst-wins aggregate is still computed (red beats yellow beats green) and is what
+the single-colour kasa backend shows, and what the cube shows when nothing is running.
+One session hitting `Stop` while another is mid-tool leaves the aggregate yellow, and
+so does a fresh `SessionStart` landing next to a session that is working. Green means
+nothing is running anywhere. Each session gets a slot file under `%TEMP%\claude-status-light\`
 keyed by its session id, written from the `session_id` on the hook's stdin JSON;
 `SessionEnd` deletes the slot. A session that dies without firing `SessionEnd` (window
 closed, crash, reboot) would pin the light yellow forever, so a slot untouched for
@@ -88,7 +96,8 @@ running tasks:
   (none)
 aggregate : yellow
 cache     : yellow
-bulb      : Office 2 is showing yellow
+cube      : reachable at 192.168.0.228:55443
+            (write-only firmware: cannot read back what it is showing)
 ```
 
 Run by hand with no stdin there is no session to attribute the colour to, so the
@@ -103,12 +112,34 @@ unfalsifiable after the fact, because nothing else records what the sessions loo
 like at the time. Keep it in `%TEMP%` — **hook processes cannot write under
 `%LOCALAPPDATA%`**, which is also why `activity.jsonl` stops updating (see Notes).
 
-**Backend.** Ships with a TP-Link Kasa driver (tested on a KL125) speaking the legacy
-autokey-XOR protocol directly over TCP 9999. No Python, no library, no cloud, no
-credentials, no dependencies at all — just a socket write. Typical call is 15-150 ms,
-which matters because these hooks fire on every tool use. Set `$BulbIp` to your bulb's
-address; a DHCP reservation is recommended, since the script fails silently if the
-address moves.
+**Backend.** Set `$Backend` to pick one. Both are dependency-free socket writes: no
+Python, no library, no cloud, no credentials. Typical call is 15-150 ms, which matters
+because these hooks fire on every tool use. A DHCP reservation is recommended for
+either, since the script fails silently if the address moves.
+
+`cube` (default) drives a Yeelight Cube Smart Lamp Lite (YLFWD-0062, reported model
+`CubeLite`) over Yeelight LAN Control on TCP 55443. It is a 20x5 RGB matrix and is the
+only backend that can show per-session blocks. LAN Control must be enabled for the
+device in the Yeelight Station app or the port stays shut.
+
+The matrix methods are **undocumented and absent from the SSDP `support:` header**,
+which is empty on this device, so that header cannot be used to decide what is
+available. Driving it is `activate_fx_mode {"mode":"direct"}` followed by `update_leds`
+with a base64 RGB frame, **both on the same connection** — arming on one connection and
+pushing on another is refused with `illegal request`. `update_leds` never replies, so
+only the arming step can be checked. A pushed frame survives the connection closing,
+which is what lets short-lived hook processes drive it without a daemon.
+
+Geometry is 20 wide, 5 tall, row 0 at the top, pixel index running right to left, and
+not serpentine, so `index = row*20 + (19-x)` with x from the left. On this firmware
+`get_prop` never answers and the SSDP reply is a hardcoded stub that does not change
+when the light does, so `status` cannot read back what the panel is showing and says so
+rather than guessing.
+
+`kasa` drives a TP-Link Kasa bulb (tested on a KL125) over the legacy autokey-XOR
+protocol on TCP 9999, and shows the aggregate colour only. Set `$BulbIp`. Note this is
+the LEGACY protocol; newer Kasa/Tapo devices speak KLAP over port 80 and need cloud
+credentials.
 
 To drive different hardware (a USB tower light, an addressable LED strip, a Home
 Assistant entity), replace `Set-Light`. Nothing else in the file changes.
