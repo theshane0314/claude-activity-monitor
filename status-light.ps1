@@ -65,16 +65,22 @@
 #     cannot ask this light what it is showing; it reports the cache and says
 #     so. Do not "fix" this by reading SSDP.
 #
-# GOING DARK. The light is off when there is nothing to report: the Claude
-# desktop app is closed, or no hook has fired in an hour. Neither of those can
-# be noticed by a hook, because the whole point is that nothing is happening and
-# so nothing fires. That is what `watchdog` is for: run it on a schedule (a
-# Scheduled Task every couple of minutes) and it darkens the light when either
-# condition is met, and otherwise re-asserts the current picture.
+# GOING DARK. The light is off when there is nothing to report: no session is
+# live, the Claude desktop app is closed, or no hook has fired in 20 minutes.
+# None of those can be noticed by a hook, because the whole point is that
+# nothing is happening and so nothing fires.
 #
-# Recent activity always wins over the app check, so running Claude Code in a
-# terminal with the desktop app closed keeps the light alive rather than
-# blacking it out while work is visibly happening.
+# `watchdog` is the periodic check, run from a Scheduled Task. It darkens the
+# light when a condition is met and otherwise re-asserts the current picture.
+# A Scheduled Task cannot repeat faster than once a minute, though, and an app
+# close should be instant, so watch-app.ps1 sits resident and polls for the app
+# every couple of seconds. See install-watchdog.ps1.
+#
+# Recent activity wins over the app check on the PERIODIC path, so running
+# Claude Code in a terminal with the desktop app closed does not black the light
+# out mid-task. Watching the app process actually EXIT is a different and much
+# stronger signal, so watch-app.ps1 darkens on that transition regardless; if
+# terminal work really is still going, its next hook repaints within seconds.
 #
 # Usage: status-light.ps1 <red|yellow|green|off|status|watchdog>
 #
@@ -111,13 +117,17 @@ $GapUnits = 1
 # session, with the per-session blocks filling the rows beneath. One red pixel
 # among a hundred is easy to miss; a red stripe across the top is not. Off by
 # default, which gives the plain "every session gets an equal block" layout.
-$SummaryRow = $false
+$SummaryRow = $true
 
 # What to show when no session is live. $false fills the panel with the
 # aggregate colour (green), preserving the original "green means finished, ready
 # for a new task" contract. $true leaves it dark, which is quieter in a dark
 # room but indistinguishable from the light being broken.
-$IdleDark = $false
+#
+# ON. Green-when-idle meant closing the app left a green panel sitting there for
+# minutes until the timeout caught up. The last session ending now goes straight
+# to dark, which is the honest reading of "nothing is running".
+$IdleDark = $true
 
 $Brightness = 40          # 1-100. On the cube this scales the pixel values
                           # directly, since direct mode has no separate
@@ -137,7 +147,7 @@ $Priority = @{ green = 1; yellow = 2; red = 3 }
 # -- going dark --
 # No hook in this long and the light goes out. Must be comfortably longer than
 # $StaleMinutes, or slots would still be live on a panel that has gone dark.
-$DarkAfterMinutes = 60
+$DarkAfterMinutes = 20
 
 # Activity newer than this means something is genuinely running, which overrides
 # the desktop-app check below. Without it, using Claude Code from a terminal with

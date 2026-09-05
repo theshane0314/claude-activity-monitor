@@ -35,6 +35,11 @@ Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Wind
 | 🔴 red | waiting for confirmation | `PermissionRequest`, `Notification` |
 | 🟡 yellow | running | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` |
 | 🟢 green | finished, ready for a new task | `Stop`, `SessionStart`, `SessionEnd` |
+| ⬛ dark | nothing running at all | see **Going dark** |
+
+`$SummaryRow` (on) reserves the top row as a full-width bar showing the worst state
+across every session, with the per-session blocks filling the four rows beneath: one red
+pixel among a hundred is easy to miss, a red stripe across the top is not.
 
 Usage: `status-light.ps1 <red|yellow|green|off|status>`
 
@@ -138,22 +143,37 @@ not serpentine, so `index = row*20 + (19-x)` with x from the left. On this firmw
 when the light does, so `status` cannot read back what the panel is showing and says so
 rather than guessing.
 
-**Going dark.** The panel is off when there is nothing to report: the Claude desktop
-app is closed, or no hook has fired in an hour (`$DarkAfterMinutes`). Neither can be
-noticed by a hook, because both conditions *are* the absence of hook events, so
-`install-watchdog.ps1` registers a Scheduled Task that runs `status-light.ps1 watchdog`
-every two minutes. The watchdog skips the network write unless the picture actually
-changed, so a quiet machine costs a process spawn and a couple of file reads per tick.
+**Going dark.** The panel is off when there is nothing to report, in three ways:
 
-Recent activity (`$ActiveGraceMinutes`, default 2) outranks the app check, so running
-Claude Code from a terminal with the desktop app closed keeps the panel lit rather than
-blacking it out mid-task. The app is matched on executable path, because the CLI is
-also called `claude.exe`: the desktop app lives under `\WindowsApps\Claude_...`, the
-CLI under `AppData\Roaming`.
+| Condition | How fast | Mechanism |
+|---|---|---|
+| last session ends | immediate | `$IdleDark`, on the hook itself |
+| desktop app closes | ~2 seconds | `watch-app.ps1` polling the process table |
+| nothing run for `$DarkAfterMinutes` (20) | ~20 seconds | `status-light.ps1 watchdog` |
+
+None of it can be driven by hooks, because all three conditions *are* the absence of
+hook events: if nothing is running, nothing fires, and the panel would sit showing the
+last thing it was told forever.
+
+`install-watchdog.ps1` registers a Scheduled Task that launches **`watch-app.ps1`**,
+which sits resident, polls for the desktop app every couple of seconds, and runs the
+full dark check every 20. A Scheduled Task cannot repeat more often than once a minute,
+which is why the check is not simply on the task timer: closing the app that way
+measurably left the panel lit for about four minutes. The task still repeats every five
+minutes as a **supervisor** — `MultipleInstances=IgnoreNew` skips the tick while the
+watcher is alive, and the first tick after it dies restarts it.
+
+Recent activity (`$ActiveGraceMinutes`, default 2) outranks the app check on the
+periodic path, so running Claude Code from a terminal with the desktop app closed is not
+blacked out mid-task. Watching the app process actually *exit* is a much stronger signal,
+so `watch-app.ps1` darkens on that transition regardless; if terminal work really is
+still going, its next hook repaints within seconds. The app is matched on executable
+path, because the CLI is also called `claude.exe`: the desktop app lives under
+`\WindowsApps\Claude_...`, the CLI under `AppData\Roaming`.
 
 ```powershell
-.\install-watchdog.ps1           # register
-.\install-watchdog.ps1 -Remove   # unregister
+.\install-watchdog.ps1           # register + start the watcher
+.\install-watchdog.ps1 -Remove   # unregister + stop it
 ```
 
 **Ordering.** Blocks run oldest session leftmost, by the creation time of the slot file,
