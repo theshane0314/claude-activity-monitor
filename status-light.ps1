@@ -85,7 +85,7 @@
 # stronger signal, so watch-app.ps1 darkens on that transition regardless; if
 # terminal work really is still going, its next hook repaints within seconds.
 #
-# Usage: status-light.ps1 <red|yellow|green|off|status|watchdog>
+# Usage: status-light.ps1 <red|yellow|green|off|status|watchdog|prune>
 #
 # Run from a hook, the event JSON arrives on stdin and the colour is recorded
 # against that session's id. Run by hand with no stdin, the colour is forced
@@ -97,7 +97,7 @@
 
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('red', 'yellow', 'green', 'off', 'status', 'watchdog')]
+    [ValidateSet('red', 'yellow', 'green', 'off', 'status', 'watchdog', 'prune')]
     [string]$State
 )
 
@@ -181,6 +181,24 @@ $ReassertSeconds = 120
 # finished task stops holding a block almost immediately.
 $TaskCacheSeconds = 10
 $TaskCacheFile = Join-Path $env:TEMP 'claude-status-light.tasks'
+
+# Only probe task files this recent. Every hook instance was opening all 731
+# .output files exclusively, and those instances collide with each other: that
+# collision is the most likely source of the spurious access-denied that made a
+# working session read as idle. Bounded to 24h it is ~127 files here.
+#
+# The bound uses the NEWER of write and creation time, because a quiet task
+# (a long test suite that prints nothing) keeps its creation timestamp and would
+# otherwise age out while still running. A command running longer than this
+# window is missed and its session shows green; 24h is far beyond any real
+# backgrounded command, but that is the trade being made.
+$TaskScanMaxAgeHours = 24
+
+# `prune` deletes task .output files older than this. Claude Code already cleans
+# up at about 7 days on its own, so this is a BACKSTOP for when that fails, not
+# the primary mechanism, and it deliberately does not shorten that retention.
+# Lower it only if you are sure you will never want the output back.
+$TaskPruneDays = 7
 
 $ActivityFile = Join-Path $env:TEMP 'claude-status-light.activity'
 $CacheFile = Join-Path $env:TEMP 'claude-status-light.state'   # colour on the bulb
@@ -553,19 +571,25 @@ function Get-RunningTasks {
     #
     # Every session is scanned, not just the ones with a slot, because a task
     # outlives the turn that started it and can outlive the slot's staleness
-    # sweep. Roughly 200 ms over a few hundred files, and only ever paid on the
-    # transition to green.
+    # sweep. Files older than $TaskScanMaxAgeHours are skipped without being
+    # opened, which is most of them.
     param([switch]$StopAtFirst)
 
     $found = New-Object System.Collections.Generic.List[string]
     $root = Join-Path $env:TEMP 'claude'
     if (-not (Test-Path -LiteralPath $root)) { return $found }
+    $cut = (Get-Date).AddHours(-$TaskScanMaxAgeHours)
 
     foreach ($proj in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
         foreach ($sess in @(Get-ChildItem -LiteralPath $proj.FullName -Directory -ErrorAction SilentlyContinue)) {
             $tasks = Join-Path $sess.FullName 'tasks'
             if (-not (Test-Path -LiteralPath $tasks)) { continue }
             foreach ($f in @(Get-ChildItem -LiteralPath $tasks -Filter '*.output' -File -ErrorAction SilentlyContinue)) {
+                # Newer of the two: a task that has printed nothing still has a
+                # fresh creation time, and would otherwise be skipped while live.
+                $newest = if ($f.LastWriteTime -gt $f.CreationTime) { $f.LastWriteTime } else { $f.CreationTime }
+                if ($newest -lt $cut) { continue }
+
                 $locked = $false
                 try {
                     $fs = [System.IO.File]::Open($f.FullName, 'Open', 'ReadWrite', 'None')
@@ -782,6 +806,36 @@ function Set-Light {
         if ($null -ne $prev) { Set-Content -Path $CacheFile -Value $prev.Trim() -NoNewline }
         elseif (Test-Path $CacheFile) { Remove-Item $CacheFile -Force -ErrorAction SilentlyContinue }
     }
+}
+
+if ($State -eq 'prune') {
+    # Delete task .output files older than $TaskPruneDays, skipping any that are
+    # still held: a locked file is a running command whatever its age says.
+    $root = Join-Path $env:TEMP 'claude'
+    if (-not (Test-Path -LiteralPath $root)) { "no task root at $root"; exit 0 }
+    $cut = (Get-Date).AddDays(-$TaskPruneDays)
+    $n = 0; $bytes = 0; $skipped = 0; $seen = 0
+
+    foreach ($proj in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($sess in @(Get-ChildItem -LiteralPath $proj.FullName -Directory -ErrorAction SilentlyContinue)) {
+            $tasks = Join-Path $sess.FullName 'tasks'
+            if (-not (Test-Path -LiteralPath $tasks)) { continue }
+            foreach ($f in @(Get-ChildItem -LiteralPath $tasks -Filter '*.output' -File -ErrorAction SilentlyContinue)) {
+                $seen++
+                $newest = if ($f.LastWriteTime -gt $f.CreationTime) { $f.LastWriteTime } else { $f.CreationTime }
+                if ($newest -ge $cut) { continue }
+                # Never delete something still open, however old it looks.
+                try { $h = [System.IO.File]::Open($f.FullName, 'Open', 'Read', 'None'); $h.Close() }
+                catch { $skipped++; continue }
+                $size = $f.Length
+                try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $n++; $bytes += $size }
+                catch { $skipped++ }
+            }
+        }
+    }
+    "scanned $seen task files, older than $TaskPruneDays days: deleted $n ({0:n1} MB), skipped $skipped" -f ($bytes / 1MB)
+    Write-Trace "prune: deleted $n skipped $skipped of $seen"
+    exit 0
 }
 
 if ($State -eq 'status') { Show-Status; exit 0 }

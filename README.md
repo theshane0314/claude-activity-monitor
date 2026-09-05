@@ -160,6 +160,25 @@ not serpentine, so `index = row*20 + (19-x)` with x from the left. On this firmw
 when the light does, so `status` cannot read back what the panel is showing and says so
 rather than guessing.
 
+**Cost of the background-task scan.** A session that ended its turn but left a
+backgrounded command running is still working, and the only signal for that is whether its
+`.output` file can be opened exclusively. Two things keep it cheap. `Get-BusySessions`
+caches the answer for `$TaskCacheSeconds` (10), because it is now needed on every hook
+rather than only on the way to green. And only files newer than `$TaskScanMaxAgeHours`
+(24) are opened at all: here that is 127 files instead of 731, an 83% cut. That matters
+for more than speed, since every hook instance was opening all of them exclusively and
+those instances collide with each other.
+
+The age bound uses the **newer** of write and creation time, because a quiet task (a long
+test suite that prints nothing) keeps its creation timestamp and would otherwise age out
+while still running. A command running longer than the window is missed and its session
+shows green; 24h is well beyond any real backgrounded command, but that is the trade.
+
+`status-light.ps1 prune` deletes task `.output` files older than `$TaskPruneDays` (7),
+skipping any still held open. Claude Code already cleans up at roughly seven days on its
+own, so this normally deletes nothing; it exists so a failure of that cleanup cannot
+quietly grow the scan forever. The watcher runs it once a day.
+
 **Going dark.** The panel is off when there is nothing to report, in three ways:
 
 | Condition | How fast | Mechanism |

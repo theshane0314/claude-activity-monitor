@@ -22,7 +22,8 @@
 
 param(
     [int]$PollSeconds = 2,        # how fast an app close is noticed
-    [int]$IdleCheckSeconds = 20   # how often the full dark check runs
+    [int]$IdleCheckSeconds = 20,  # how often the full dark check runs
+    [int]$PruneHours = 24         # how often stale task .output files are swept
 )
 
 $ErrorActionPreference = 'Continue'
@@ -73,6 +74,9 @@ Write-Trace "started (poll ${PollSeconds}s, idle check ${IdleCheckSeconds}s)"
 try {
     $wasRunning = Test-AppRunning
     $lastIdleCheck = Get-Date
+    # First prune one interval from now, not at startup: the watcher is
+    # restarted by the supervisor and should not sweep on every restart.
+    $lastPrune = Get-Date
 
     while ($true) {
         Start-Sleep -Seconds $PollSeconds
@@ -100,6 +104,15 @@ try {
         if (((Get-Date) - $lastIdleCheck).TotalSeconds -ge $IdleCheckSeconds) {
             $lastIdleCheck = Get-Date
             Invoke-StatusLight -Verb 'watchdog'
+        }
+
+        # Sweep stale task output files. Claude Code appears to clean up at about
+        # seven days on its own, so this normally deletes nothing and exists so
+        # that a failure of its cleanup cannot quietly grow the scan forever.
+        if (((Get-Date) - $lastPrune).TotalHours -ge $PruneHours) {
+            $lastPrune = Get-Date
+            Write-Trace 'running prune'
+            Invoke-StatusLight -Verb 'prune'
         }
     }
 }
