@@ -571,11 +571,21 @@ function Get-RunningTasks {
                     $fs = [System.IO.File]::Open($f.FullName, 'Open', 'ReadWrite', 'None')
                     $fs.Close()
                 }
-                # A file that vanished or cannot be reached is not a running task.
-                # Only a sharing violation means someone else still holds it.
+                # A file that VANISHED is not a running task. Anything else that
+                # stops us opening a file we just enumerated means something else
+                # has it, which is exactly what we are looking for.
+                #
+                # UnauthorizedAccessException used to be swallowed here as
+                # "cannot be reached", and that was the bug: a genuinely held
+                # task file reported access-denied rather than sharing-violation
+                # (observed on a live 13-minute suite, while a probe from another
+                # process saw a plain sharing violation on the SAME file at the
+                # same moment). Treating that as idle made a working session go
+                # green. Access denied on a file that is sitting right there is
+                # not evidence of idleness.
                 catch [System.IO.FileNotFoundException] { }
                 catch [System.IO.DirectoryNotFoundException] { }
-                catch [System.UnauthorizedAccessException] { }
+                catch [System.UnauthorizedAccessException] { $locked = $true }
                 catch [System.IO.IOException] { $locked = $true }
                 catch { }
 
