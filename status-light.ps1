@@ -7,10 +7,19 @@
 # EVERY LIVE SESSION GETS ITS OWN BLOCK OF THE PANEL, side by side, with a dark
 # column between neighbours so the blocks are countable at a glance.
 #
-# ALL BLOCKS ARE THE SAME WIDTH. Any width that does not divide evenly goes into
+# ALL BLOCKS ARE THE SAME SIZE. Anything that does not divide evenly goes into
 # the GAPS, never into a block, so two sessions on the 20-wide panel are 9/2/9
 # rather than 10/1/9. Comparing two blocks should never mean asking whether one
-# is genuinely wider or just holding the remainder. Everything is visible at
+# is genuinely bigger or just holding the remainder.
+#
+# UP TO THREE SESSIONS THE PANEL IS SPLIT LEFT TO RIGHT ONLY, full height each.
+# FROM FOUR IT IS SPLIT BOTH WAYS, so four sessions are quadrants: two rows of
+# two, each 9x2. Splitting the height any earlier would waste it, since a third
+# of a 20-wide panel is still a comfortable block at full height.
+#
+# The grid grows by columns first and only adds rows when the columns run out,
+# up to 20x5, which is one pixel each for 100 sessions. A grid with more cells
+# than sessions simply leaves the spare cells dark. Everything is visible at
 # once; nothing has to be waited for.
 #
 # The separators are dropped only when they no longer fit, since a gap costs a
@@ -336,6 +345,24 @@ function Get-Spans {
     return , $spans
 }
 
+function Get-Grid {
+    # Columns and rows of session cells for $Count sessions.
+    #
+    # One row up to three: a third of the panel at full height reads better than
+    # a sixth of it half-height, and there is nothing to gain from the split.
+    # Two rows from four, which makes four sessions quadrants.
+    #
+    # Rows are only added beyond two when the columns genuinely run out, so the
+    # cells stay as tall as possible for as long as possible.
+    param([int]$Count)
+
+    $rows = if ($Count -le 3) { 1 } else { 2 }
+    while ($rows -lt $MatrixH -and [Math]::Ceiling($Count / $rows) -gt $MatrixW) { $rows++ }
+    $cols = [Math]::Ceiling($Count / $rows)
+    if ($cols -lt 1) { $cols = 1 }
+    return @($cols, $rows)
+}
+
 function Set-Block {
     # Paint columns $X0..$X1 inclusive over rows $Y0..$Y1 inclusive.
     param([byte[]]$Buf, [int]$X0, [int]$X1, [int]$Y0, [int]$Y1, [int]$Rgb)
@@ -355,11 +382,8 @@ function Set-Block {
 }
 
 function Get-MatrixFrame {
-    # One contiguous block per session, left to right, as base64 RGB.
-    #
-    # Up to $MatrixW sessions get whole columns. Past that the columns run out
-    # and pixels are allocated individually in column-major order (down a
-    # column, then right), so blocks stay contiguous down to one pixel each.
+    # One equal cell per session on a grid, as base64 RGB. See Get-Grid for how
+    # the grid is chosen and Get-Spans for how each axis is divided.
     param([string[]]$States, [string]$Idle = 'green')
 
     $states = @($States)
@@ -387,30 +411,33 @@ function Get-MatrixFrame {
         Set-Block -Buf $buf -X0 0 -X1 ($MatrixW - 1) -Y0 0 -Y1 0 -Rgb (Get-Rgb $worst)
         $top = 1
     }
-    $rows = $MatrixH - $top
+    $avail = $MatrixH - $top
 
-    if ($n -le $MatrixW) {
-        $spans = Get-Spans -Count $n -Total $MatrixW
-        for ($i = 0; $i -lt $n; $i++) {
-            $sp = $spans[$i]
-            if ($sp[1] -le 0) { continue }
-            Set-Block -Buf $buf -X0 $sp[0] -X1 ($sp[0] + $sp[1] - 1) `
-                -Y0 $top -Y1 ($MatrixH - 1) -Rgb (Get-Rgb $states[$i])
-        }
-        return [Convert]::ToBase64String($buf)
-    }
+    # More sessions than cells cannot be drawn; the newest are dropped rather
+    # than silently merged, which would be a lie about how many are running.
+    if ($n -gt ($MatrixW * $avail)) { $n = $MatrixW * $avail }
 
-    $slots = $MatrixW * $rows
-    if ($n -gt $slots) { $n = $slots }
-    $spans = Get-Spans -Count $n -Total $slots
+    $grid = Get-Grid -Count $n
+    $cols = $grid[0]
+    $gridRows = $grid[1]
+    if ($gridRows -gt $avail) { $gridRows = $avail }
+
+    # Both axes divided by the same rule, so cells are equal in both directions
+    # and the leftover lands in the gaps.
+    $xs = Get-Spans -Count $cols -Total $MatrixW
+    $ys = Get-Spans -Count $gridRows -Total $avail
+
+    # Reading order: oldest session top-left, filling right then down.
     for ($i = 0; $i -lt $n; $i++) {
-        $sp = $spans[$i]
-        $rgb = Get-Rgb $states[$i]
-        for ($s = $sp[0]; $s -lt ($sp[0] + $sp[1]); $s++) {
-            $x = [Math]::Floor($s / $rows)
-            $y = $top + ($s % $rows)
-            Set-Block -Buf $buf -X0 $x -X1 $x -Y0 $y -Y1 $y -Rgb $rgb
-        }
+        $cx = $i % $cols
+        $cy = [Math]::Floor($i / $cols)
+        if ($cy -ge $gridRows) { break }
+        $sx = $xs[$cx]
+        $sy = $ys[$cy]
+        if ($sx[1] -le 0 -or $sy[1] -le 0) { continue }
+        Set-Block -Buf $buf -X0 $sx[0] -X1 ($sx[0] + $sx[1] - 1) `
+            -Y0 ($top + $sy[0]) -Y1 ($top + $sy[0] + $sy[1] - 1) `
+            -Rgb (Get-Rgb $states[$i])
     }
     return [Convert]::ToBase64String($buf)
 }
@@ -504,18 +531,22 @@ function Show-Status {
     $n = $states.Count
     if ($n -eq 0) { "display   : all off (no live sessions)" }
     else {
-        $rows = $MatrixH - $(if ($SummaryRow) { 1 } else { 0 })
-        $unit = if ($n -le $MatrixW) { 'col' } else { 'px' }
-        $total = if ($n -le $MatrixW) { $MatrixW } else { $MatrixW * $rows }
-        $spans = Get-Spans -Count $n -Total $total
-        $desc = (0..($n - 1) | ForEach-Object { "" + $states[$_] + '=' + $spans[$_][1] + $unit }) -join ', '
-        $gapDesc = if ($n -lt 2) { 'no gaps needed' }
-        else {
-            $gw = @(1..($n - 1) | ForEach-Object { $spans[$_][0] - ($spans[$_ - 1][0] + $spans[$_ - 1][1]) })
-            'gaps ' + (($gw | Sort-Object -Unique) -join '/') + $unit
+        $avail = $MatrixH - $(if ($SummaryRow) { 1 } else { 0 })
+        $grid = Get-Grid -Count $n
+        $cols = $grid[0]; $gridRows = [Math]::Min($grid[1], $avail)
+        $xs = Get-Spans -Count $cols -Total $MatrixW
+        $ys = Get-Spans -Count $gridRows -Total $avail
+        $cells = $cols * $gridRows
+        "display   : $n session(s) on a ${cols}x${gridRows} grid, cells $($xs[0][1])x$($ys[0][1]), oldest top-left"
+        if ($cells -gt $n) { "            $($cells - $n) spare cell(s) left dark" }
+        for ($r = 0; $r -lt $gridRows; $r++) {
+            $row = @()
+            for ($c = 0; $c -lt $cols; $c++) {
+                $i = ($r * $cols) + $c
+                $row += $(if ($i -lt $n) { $states[$i] } else { '-' })
+            }
+            "            [" + ($row -join ' ') + "]"
         }
-        "display   : $n block(s) left to right, oldest first, all $($spans[0][1])$unit wide, $gapDesc"
-        "            $desc"
         if ($SummaryRow) { "            top row = worst state summary" }
     }
 

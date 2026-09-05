@@ -51,11 +51,16 @@ Usage: `status-light.ps1 <red|yellow|green|off|status>`
 
 **Multiple sessions.** On the cube backend every live session gets its own block of
 the panel, side by side, so nothing is hidden behind an aggregate. The cube is a 20x5
-matrix and **all blocks are the same width**: one session fills all 20 columns, two take
-9 either side of a 2-column gap, three take 6/1/6/1/6. Anything that will not divide
-evenly is spent on the gaps, never on a block, because a wider block reads as meaning
-something and it does not. The leftover is added to the gaps middle-outwards, so the
-spare dark space stays centred. Separators are
+matrix and **all cells are the same size**. Anything that will not divide evenly is spent
+on the gaps, never on a cell, because a bigger cell reads as meaning something and it does
+not. The leftover is added to the gaps middle-outwards, so the spare dark stays centred.
+
+Up to three sessions the panel splits **left to right only**, full height each: 20, then
+9/2/9, then 6/1/6/1/6. From four it splits **both ways**, so four sessions are quadrants of
+9x2. The grid grows by columns first and adds rows only when the columns run out, up to
+20x5, which is one pixel each for 100 sessions. Sessions fill it in reading order, oldest
+top-left, and a grid with more cells than sessions leaves the spare ones dark rather than
+making one session bigger. Separators are
 dropped wholesale once they stop fitting (past 10 sessions), and past 20 the columns
 run out and blocks are allocated per pixel instead, so all 100 LEDs can carry 100
 sessions at once.
