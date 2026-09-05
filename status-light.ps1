@@ -112,6 +112,10 @@ $CubeColors = @{ red = 0xFF0000; yellow = 0xFFC000; green = 0x00FF00 }
 $MatrixW = 20
 $MatrixH = 5
 
+# The cube is mounted upside down (it makes the cable run cleaner). A 180 degree
+# rotation inverts BOTH axes, so this is not just a row flip. See Get-PixelIndex.
+$Flip180 = $true
+
 # Dark units left between neighbouring blocks. Automatically dropped when the
 # blocks would no longer fit, so this is a preference and not a guarantee.
 $GapUnits = 1
@@ -228,9 +232,19 @@ function Send-Yeelight {
 }
 
 function Get-PixelIndex {
-    # x from the LEFT (0..W-1), y from the TOP (0..H-1). See the geometry note
-    # at the top of the file: rows run right to left and are not serpentine.
+    # x from the LEFT AS VIEWED (0..W-1), y from the TOP AS VIEWED (0..H-1).
+    #
+    # Native panel order is row-major with each row running RIGHT TO LEFT and no
+    # serpentine, so a pixel at (x, y) is at index y*W + (W-1-x).
+    #
+    # Mounted upside down, a 180 degree rotation puts the physical pixel (a, b)
+    # where the viewer sees (W-1-a, H-1-b). Solving for the physical pixel under
+    # a viewed (x, y) gives a = W-1-x and b = H-1-y, so
+    #     index = (H-1-y)*W + (W-1-(W-1-x)) = (H-1-y)*W + x
+    # The right-to-left run and the x inversion cancel, which is why the flipped
+    # form looks like an ordinary left-to-right raster.
     param([int]$X, [int]$Y)
+    if ($Flip180) { return (($MatrixH - 1 - $Y) * $MatrixW) + $X }
     return ($Y * $MatrixW) + ($MatrixW - 1 - $X)
 }
 
