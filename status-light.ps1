@@ -163,6 +163,14 @@ $ActiveGraceMinutes = 2
 $RequireAppRunning = $true
 $AppPathMatch = '\\WindowsApps\\Claude'
 
+# Push the frame again after this long even when nothing changed. The light is
+# WRITE-ONLY: there is no way to ask what it is actually showing, so anything
+# that desyncs it -- unplugging it to move it, a power cut, someone using the
+# Yeelight app -- would otherwise be invisible, and the cache would go on
+# skipping the write forever. One frame every couple of minutes is the cost of
+# not being able to read the device.
+$ReassertSeconds = 120
+
 $ActivityFile = Join-Path $env:TEMP 'claude-status-light.activity'
 $CacheFile = Join-Path $env:TEMP 'claude-status-light.state'   # colour on the bulb
 $StateDir  = Join-Path $env:TEMP 'claude-status-light'         # one file per session
@@ -666,12 +674,17 @@ function Set-Light {
 
     $key = Get-CacheKey -Want $Want -Slots $Slots
 
-    # Skip everything when the light already shows this. PreToolUse and
-    # PostToolUse fire constantly, so without this the light would take a TCP
-    # connection per tool call -- and would flash on every one of them.
+    # Skip when the light already shows this AND we pushed recently. PreToolUse
+    # and PostToolUse fire constantly, so without the cache the light would take
+    # a TCP connection per tool call. But the cache is only a belief about a
+    # device that cannot be read back, so it expires: see $ReassertSeconds.
     if (Test-Path $CacheFile) {
         $last = (Get-Content $CacheFile -Raw -ErrorAction SilentlyContinue)
-        if ($null -ne $last -and $last.Trim() -eq $key) { return }
+        if ($null -ne $last -and $last.Trim() -eq $key) {
+            $age = ((Get-Date) - (Get-Item $CacheFile).LastWriteTime).TotalSeconds
+            if ($age -lt $ReassertSeconds) { return }
+            Write-Trace ('re-asserting after {0:n0}s' -f $age)
+        }
     }
 
     # Claim the state BEFORE the write. PreToolUse and PostToolUse both ask for

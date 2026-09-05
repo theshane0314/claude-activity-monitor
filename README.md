@@ -122,6 +122,18 @@ unfalsifiable after the fact, because nothing else records what the sessions loo
 like at the time. Keep it in `%TEMP%` — **hook processes cannot write under
 `%LOCALAPPDATA%`**, which is also why `activity.jsonl` stops updating (see Notes).
 
+**Recovering from a power cycle.** The panel is written only when the composition
+changes, or the hooks would open a TCP connection per tool call. But the light cannot be
+read back, so anything that desyncs it — unplugging it to move it, a power cut, someone
+using the Yeelight app — would be invisible and the cache would skip the write forever.
+So the cache expires: `$ReassertSeconds` (120) re-pushes the current frame regardless.
+Unplug it, move it, plug it back in, and it repaints within two minutes with no
+intervention.
+
+The one thing that does not self-heal is the address. `$CubeIp` is hardcoded, so give the
+cube a DHCP reservation on the router; without one a new lease silently breaks everything
+and `status-light.ps1 status` will say `UNREACHABLE`.
+
 **Backend.** Drives a Yeelight Cube Smart Lamp Lite (YLFWD-0062, reported model
 `CubeLite`) over Yeelight LAN Control on TCP 55443, a 20x5 RGB matrix. A
 dependency-free socket write: no Python, no library, no cloud, no credentials. Typical
