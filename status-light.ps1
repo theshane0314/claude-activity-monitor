@@ -175,6 +175,13 @@ $AppPathMatch = '\\WindowsApps\\Claude'
 # not being able to read the device.
 $ReassertSeconds = 120
 
+# Scanning for running background tasks costs a few hundred milliseconds, and
+# now has to happen on EVERY hook rather than only on the way to green (see
+# Get-Picture), so the answer is cached for this long. Short enough that a
+# finished task stops holding a block almost immediately.
+$TaskCacheSeconds = 10
+$TaskCacheFile = Join-Path $env:TEMP 'claude-status-light.tasks'
+
 $ActivityFile = Join-Path $env:TEMP 'claude-status-light.activity'
 $CacheFile = Join-Path $env:TEMP 'claude-status-light.state'   # colour on the bulb
 $StateDir  = Join-Path $env:TEMP 'claude-status-light'         # one file per session
@@ -424,6 +431,15 @@ function Show-Status {
     $tasks = @(Get-RunningTasks)
     if ($tasks.Count -eq 0) { "  (none)" } else { $tasks | ForEach-Object { "  $_" } }
 
+    # Computed here, before anything reports on it, and WITHOUT -Force. An
+    # earlier version forced a rescan at this point, which overwrote the busy
+    # cache before Get-Picture read it: `status` then showed a different picture
+    # from the one the hooks would actually paint.
+    $pic = Get-Picture
+    $busy = Get-BusySessions
+    "busy      : " + $(if ($busy.Count -eq 0) { '(no session has a running background task)' }
+        else { ($busy.Keys | Sort-Object) -join ', ' })
+
     $last = Get-LastActivity
     if ($null -eq $last) { "activity  : never recorded" }
     else { "activity  : {0:HH:mm:ss}, {1:n1} min ago" -f $last, ((Get-Date) - $last).TotalMinutes }
@@ -431,7 +447,6 @@ function Show-Status {
     $reason = Get-DarkReason
     "dark      : " + $(if ($null -ne $reason) { "YES - $reason" } else { 'no' })
 
-    $pic = Get-Picture
     "aggregate : " + $pic.Aggregate
     "cache     : " + $(if (Test-Path $CacheFile) { (Get-Content $CacheFile -Raw -ErrorAction SilentlyContinue).Trim() } else { '(none)' })
 
@@ -615,16 +630,43 @@ function Get-DarkReason {
     return $null
 }
 
+function Get-BusySessions {
+    # Sessions with a backgrounded command still running, as a hashtable keyed by
+    # the short session id.
+    #
+    # Get-RunningTasks walks every session's task directory and is far too
+    # expensive to run on each PreToolUse and PostToolUse, so the result is
+    # cached for $TaskCacheSeconds. That is the price of needing the answer on
+    # every hook instead of only when everything looked idle.
+    param([switch]$Force)
+
+    if (-not $Force -and (Test-Path -LiteralPath $TaskCacheFile)) {
+        try {
+            $age = ((Get-Date) - (Get-Item -LiteralPath $TaskCacheFile).LastWriteTime).TotalSeconds
+            if ($age -lt $TaskCacheSeconds) {
+                $cached = @{}
+                foreach ($line in @(Get-Content -LiteralPath $TaskCacheFile -ErrorAction SilentlyContinue)) {
+                    if (-not [string]::IsNullOrWhiteSpace($line)) { $cached[$line.Trim()] = $true }
+                }
+                return $cached
+            }
+        }
+        catch { }
+    }
+
+    $busy = @{}
+    foreach ($t in @(Get-RunningTasks)) { $busy[($t -split '/')[0]] = $true }
+    # Written even when empty: the file's timestamp IS the cache, so skipping the
+    # write on "no tasks" would rescan on every single hook.
+    try { Set-Content -LiteralPath $TaskCacheFile -Value ($busy.Keys -join "`n") -NoNewline }
+    catch { }
+    return $busy
+}
+
 function Get-Picture {
     # The whole state of the world in one pass: one slot per live session,
-    # ordered stably by session key so the cycle does not reshuffle between hook
-    # events, plus the worst-wins aggregate over all of them.
-    #
-    # Get-RunningTasks costs a few hundred milliseconds, so it is still only run
-    # when every session already looks idle. That keeps the common case (some
-    # session mid-tool) free, while green still means nothing is running.
+    # ordered oldest first, plus the worst-wins aggregate over all of them.
     $slots = New-Object System.Collections.Generic.List[object]
-    $best = 'green'
     $cut = (Get-Date).AddMinutes(-$StaleMinutes)
 
     # Oldest first: CreationTime is when the session fired its FIRST hook, and
@@ -644,26 +686,37 @@ function Get-Picture {
                 Key   = $f.BaseName.Substring(0, [Math]::Min(8, $f.BaseName.Length))
                 State = $s
             })
-        if ($Priority[$s] -gt $Priority[$best]) { $best = $s }
     }
 
-    if ($best -eq 'green') {
-        # Every agent is idle, but a backgrounded command one of them launched
-        # may still be running. Attribute each to its own session where we can,
-        # so the cycle shows WHICH session is still busy and not just that one is.
-        $busy = @{}
-        foreach ($t in @(Get-RunningTasks)) { $busy[($t -split '/')[0]] = $true }
-        if ($busy.Count -gt 0) {
-            $best = 'yellow'
-            foreach ($sl in $slots) { if ($busy.ContainsKey($sl.Key)) { $sl.State = 'yellow' } }
-            # A task can outlive the session slot that started it. Still work.
-            foreach ($k in $busy.Keys) {
-                if (-not ($slots | Where-Object { $_.Key -eq $k })) {
-                    $slots.Add([pscustomobject]@{ Key = $k; State = 'yellow' })
-                }
+    # A session that ended its turn but left a backgrounded command running is
+    # still working, and its block has to say so.
+    #
+    # THIS RUNS ALWAYS, not only when the whole picture looks idle. It used to be
+    # gated on the aggregate being green, which was right when the light showed a
+    # single worst-wins colour: the only question was whether green was really
+    # green. With one block per session that gate is wrong, and wrong silently --
+    # a session sitting green with a live background task kept its green block
+    # for as long as ANY OTHER session was yellow, because the other session's
+    # yellow made the aggregate yellow and suppressed the scan entirely.
+    $busy = Get-BusySessions
+    if ($busy.Count -gt 0) {
+        # Only green is promoted. A session waiting on confirmation is red and
+        # stays red: red outranks working.
+        foreach ($sl in $slots) {
+            if ($sl.State -eq 'green' -and $busy.ContainsKey($sl.Key)) { $sl.State = 'yellow' }
+        }
+        # A task can outlive the session slot that started it. Still work.
+        foreach ($k in $busy.Keys) {
+            if (-not ($slots | Where-Object { $_.Key -eq $k })) {
+                $slots.Add([pscustomobject]@{ Key = $k; State = 'yellow' })
             }
         }
     }
+
+    # Aggregate last, over the slots as finally decided, so a promoted session
+    # counts toward it.
+    $best = 'green'
+    foreach ($sl in $slots) { if ($Priority[$sl.State] -gt $Priority[$best]) { $best = $sl.State } }
 
     return [pscustomobject]@{ Slots = $slots; Aggregate = $best }
 }
