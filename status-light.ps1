@@ -4,10 +4,13 @@
 #   yellow = running
 #   green  = finished, ready for a new task
 #
-# EVERY LIVE SESSION GETS ITS OWN BLOCK OF THE PANEL, side by side, with one
-# dark column between neighbours so the blocks are countable at a glance. The
-# cube is a 20x5 matrix, so one session fills all 20 columns, two take 10 and 9
-# either side of a gap, three take 6/6/6, and so on. Everything is visible at
+# EVERY LIVE SESSION GETS ITS OWN BLOCK OF THE PANEL, side by side, with a dark
+# column between neighbours so the blocks are countable at a glance.
+#
+# ALL BLOCKS ARE THE SAME WIDTH. Any width that does not divide evenly goes into
+# the GAPS, never into a block, so two sessions on the 20-wide panel are 9/2/9
+# rather than 10/1/9. Comparing two blocks should never mean asking whether one
+# is genuinely wider or just holding the remainder. Everything is visible at
 # once; nothing has to be waited for.
 #
 # The separators are dropped only when they no longer fit, since a gap costs a
@@ -276,35 +279,60 @@ function Get-PixelIndex {
 }
 
 function Get-Spans {
-    # Divide $Total units among $Count blocks, leaving $GapUnits dark between
-    # neighbours, and hand back @(start, length) pairs.
+    # Divide $Total units among $Count EQUAL blocks and hand back @(start, length)
+    # pairs. Whatever will not divide evenly is spent on the gaps.
     #
-    # Three sessions across 20 columns spend 2 columns on gaps, leaving 18, so
-    # 6/6/6 exactly. Any remainder goes to the leftmost blocks, which keeps the
-    # whole width used rather than leaving a ragged dark edge.
+    # Blocks of different widths are the thing to avoid: a wider block reads as
+    # meaning something, and it does not. So two sessions across 20 columns are
+    # 9/2/9, not 10/1/9, and three are 6/1/6/1/6 with nothing left over.
     #
-    # Gaps are dropped wholesale when they no longer fit, because a layout that
-    # silently drops SOME gaps would read as a miscount rather than as a
-    # deliberately tighter packing.
+    # The leftover is added to the gaps from the MIDDLE OUTWARDS, so the extra
+    # dark space stays centred instead of shoving the whole row to one side.
+    #
+    # Gaps are dropped wholesale when a block would otherwise be narrower than
+    # one unit, since a layout that silently dropped SOME gaps would read as a
+    # miscount rather than as deliberately tighter packing.
     param([int]$Count, [int]$Total)
 
-    $gap = $GapUnits
-    if (($Count + ($gap * ($Count - 1))) -gt $Total) { $gap = 0 }
-
-    $usable = $Total - ($gap * ($Count - 1))
-    $base = [Math]::Floor($usable / $Count)
-    $rem = $usable - ($base * $Count)
-
     $spans = New-Object System.Collections.Generic.List[object]
+    if ($Count -le 0) { return , $spans }
+
+    $gaps = $Count - 1
+    $gap = $GapUnits
+    if ($gaps -gt 0 -and [Math]::Floor(($Total - ($gaps * $gap)) / $Count) -lt 1) { $gap = 0 }
+
+    $width = [Math]::Floor(($Total - ($gaps * $gap)) / $Count)
+    if ($width -lt 1) { $width = 1 }
+
+    $gapWidths = New-Object 'int[]' ([Math]::Max($gaps, 0))
+    for ($i = 0; $i -lt $gaps; $i++) { $gapWidths[$i] = $gap }
+
+    # Widen gaps middle-outwards until the width is fully used.
+    $leftover = $Total - ($Count * $width) - ($gaps * $gap)
+    if ($gaps -gt 0 -and $leftover -gt 0) {
+        $order = New-Object System.Collections.Generic.List[int]
+        $mid = [Math]::Floor(($gaps - 1) / 2)
+        $order.Add($mid)
+        $d = 1
+        while ($order.Count -lt $gaps) {
+            if (($mid + $d) -lt $gaps) { $order.Add($mid + $d) }
+            if ($order.Count -lt $gaps -and ($mid - $d) -ge 0) { $order.Add($mid - $d) }
+            $d++
+        }
+        $k = 0
+        while ($leftover -gt 0) {
+            $gapWidths[$order[$k % $gaps]]++
+            $leftover--
+            $k++
+        }
+    }
+
     $pos = 0
     for ($i = 0; $i -lt $Count; $i++) {
-        $len = $base + $(if ($i -lt $rem) { 1 } else { 0 })
-        $spans.Add(@($pos, $len))
-        $pos += $len + $gap
+        $spans.Add(@($pos, $width))
+        $pos += $width
+        if ($i -lt $gaps) { $pos += $gapWidths[$i] }
     }
-    # Comma is load-bearing: PowerShell unrolls a returned collection, and with
-    # exactly ONE session that handed the caller the bare (start,length) pair
-    # instead of a list holding it, so nothing was drawn at all.
     return , $spans
 }
 
@@ -481,8 +509,12 @@ function Show-Status {
         $total = if ($n -le $MatrixW) { $MatrixW } else { $MatrixW * $rows }
         $spans = Get-Spans -Count $n -Total $total
         $desc = (0..($n - 1) | ForEach-Object { "" + $states[$_] + '=' + $spans[$_][1] + $unit }) -join ', '
-        $gapped = if (($n + ($GapUnits * ($n - 1))) -le $total) { 'with gaps' } else { 'no room for gaps' }
-        "display   : $n block(s) left to right, oldest first, $gapped"
+        $gapDesc = if ($n -lt 2) { 'no gaps needed' }
+        else {
+            $gw = @(1..($n - 1) | ForEach-Object { $spans[$_][0] - ($spans[$_ - 1][0] + $spans[$_ - 1][1]) })
+            'gaps ' + (($gw | Sort-Object -Unique) -join '/') + $unit
+        }
+        "display   : $n block(s) left to right, oldest first, all $($spans[0][1])$unit wide, $gapDesc"
         "            $desc"
         if ($SummaryRow) { "            top row = worst state summary" }
     }
