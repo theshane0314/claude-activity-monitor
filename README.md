@@ -42,9 +42,10 @@ A session earns its block on the first hook that means something is *happening*.
 previous conversation tab and each fires `SessionStart`, which otherwise planted a green
 block per restored tab and showed three sessions when only one was in use.
 
-`$SummaryRow` (on) reserves the top row as a full-width bar showing the worst state
-across every session, with the per-session blocks filling the four rows beneath: one red
-pixel among a hundred is easy to miss, a red stripe across the top is not.
+Each block is the full height of the panel. `$SummaryRow` (off) would instead reserve the
+top row as a full-width worst-state bar, with the blocks filling the four rows beneath; it
+was tried and dropped, since it costs a fifth of the panel to say something the blocks
+already say.
 
 Usage: `status-light.ps1 <red|yellow|green|off|status>`
 

@@ -121,10 +121,12 @@ $Flip180 = $true
 $GapUnits = 1
 
 # Reserve the TOP ROW as a full-width bar showing the worst state across every
-# session, with the per-session blocks filling the rows beneath. One red pixel
-# among a hundred is easy to miss; a red stripe across the top is not. Off by
-# default, which gives the plain "every session gets an equal block" layout.
-$SummaryRow = $true
+# session, with the per-session blocks filling the rows beneath.
+#
+# OFF. It was tried and it costs a fifth of the panel to say something the
+# blocks already say, and with one or two sessions the bar and the blocks are
+# the same colour anyway. Each session now gets the full height of its section.
+$SummaryRow = $false
 
 # What to show when no session is live. $false fills the panel with the
 # aggregate colour (green), preserving the original "green means finished, ready
