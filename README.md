@@ -112,15 +112,17 @@ unfalsifiable after the fact, because nothing else records what the sessions loo
 like at the time. Keep it in `%TEMP%` — **hook processes cannot write under
 `%LOCALAPPDATA%`**, which is also why `activity.jsonl` stops updating (see Notes).
 
-**Backend.** Set `$Backend` to pick one. Both are dependency-free socket writes: no
-Python, no library, no cloud, no credentials. Typical call is 15-150 ms, which matters
-because these hooks fire on every tool use. A DHCP reservation is recommended for
-either, since the script fails silently if the address moves.
+**Backend.** Drives a Yeelight Cube Smart Lamp Lite (YLFWD-0062, reported model
+`CubeLite`) over Yeelight LAN Control on TCP 55443, a 20x5 RGB matrix. A
+dependency-free socket write: no Python, no library, no cloud, no credentials. Typical
+call is 15-150 ms, which matters because these hooks fire on every tool use. A DHCP
+reservation is recommended, since the script fails silently if the address moves. LAN
+Control must be enabled for the device in the Yeelight Station app or the port stays
+shut.
 
-`cube` (default) drives a Yeelight Cube Smart Lamp Lite (YLFWD-0062, reported model
-`CubeLite`) over Yeelight LAN Control on TCP 55443. It is a 20x5 RGB matrix and is the
-only backend that can show per-session blocks. LAN Control must be enabled for the
-device in the Yeelight Station app or the port stays shut.
+A TP-Link Kasa KL125 backend used to live here and was removed once the cube took over:
+it could only ever show the aggregate colour, which is the thing this display exists to
+stop doing. It is in git history if a single-colour fallback is ever wanted.
 
 The matrix methods are **undocumented and absent from the SSDP `support:` header**,
 which is empty on this device, so that header cannot be used to decide what is
@@ -136,10 +138,28 @@ not serpentine, so `index = row*20 + (19-x)` with x from the left. On this firmw
 when the light does, so `status` cannot read back what the panel is showing and says so
 rather than guessing.
 
-`kasa` drives a TP-Link Kasa bulb (tested on a KL125) over the legacy autokey-XOR
-protocol on TCP 9999, and shows the aggregate colour only. Set `$BulbIp`. Note this is
-the LEGACY protocol; newer Kasa/Tapo devices speak KLAP over port 80 and need cloud
-credentials.
+**Going dark.** The panel is off when there is nothing to report: the Claude desktop
+app is closed, or no hook has fired in an hour (`$DarkAfterMinutes`). Neither can be
+noticed by a hook, because both conditions *are* the absence of hook events, so
+`install-watchdog.ps1` registers a Scheduled Task that runs `status-light.ps1 watchdog`
+every two minutes. The watchdog skips the network write unless the picture actually
+changed, so a quiet machine costs a process spawn and a couple of file reads per tick.
+
+Recent activity (`$ActiveGraceMinutes`, default 2) outranks the app check, so running
+Claude Code from a terminal with the desktop app closed keeps the panel lit rather than
+blacking it out mid-task. The app is matched on executable path, because the CLI is
+also called `claude.exe`: the desktop app lives under `\WindowsApps\Claude_...`, the
+CLI under `AppData\Roaming`.
+
+```powershell
+.\install-watchdog.ps1           # register
+.\install-watchdog.ps1 -Remove   # unregister
+```
+
+**Ordering.** Blocks run oldest session leftmost, by the creation time of the slot file,
+which is stamped on a session's first hook and never rewritten. A session holds its
+position for life and new ones appear on the right, instead of the whole display
+reshuffling every time a session starts or ends.
 
 To drive different hardware (a USB tower light, an addressable LED strip, a Home
 Assistant entity), replace `Set-Light`. Nothing else in the file changes.

@@ -15,10 +15,14 @@
 # are allocated per pixel (down a column, then right) so all 100 LEDs can carry
 # 100 sessions at once.
 #
+# Blocks are ordered OLDEST SESSION LEFTMOST, by the creation time of the slot
+# file, which is written on a session's first hook. So a session keeps its place
+# for as long as it lives and new ones appear on the right, rather than the
+# whole display reshuffling whenever a session starts or ends.
+#
 # An aggregate is still computed (worst state wins: red beats yellow beats
-# green). It is what the kasa backend shows, since a single-colour bulb cannot
-# do better, and what the cube shows when there is one session or none. Green
-# has to mean "nothing is running anywhere".
+# green). It is what fills the panel when nothing is running, and what `status`
+# reports. Green has to mean "nothing is running anywhere".
 #
 # "Working" includes backgrounded commands. A session that launches a test suite
 # with run_in_background and then ends its turn fires Stop, but the suite is
@@ -29,11 +33,14 @@
 # is noticeable when other lights are on. A repeat of the current state does
 # nothing at all (see the cache note below).
 #
-# Backend: set $Backend in the configuration block below.
+# Backend: a Yeelight Cube Smart Lamp Lite "ClydeCube" at 192.168.0.228,
+# Yeelight LAN Control on TCP 55443. A 20x5 RGB matrix, driven per pixel, one
+# block per session.
 #
-#   'cube' (default) - Yeelight Cube Smart Lamp Lite "ClydeCube" at
-#     192.168.0.228, Yeelight LAN Control on TCP 55443. A 20x5 RGB matrix,
-#     driven per pixel, one block per session.
+#     A TP-Link Kasa KL125 backend used to live here and was dropped once the
+#     cube took over: it could only ever show the aggregate colour, which is the
+#     thing this display exists to stop doing. It is in git history if a
+#     single-colour fallback is ever wanted again.
 #
 #     The matrix methods are UNDOCUMENTED and absent from the SSDP 'support:'
 #     header, which is empty on this device. Do not conclude from that header
@@ -55,17 +62,21 @@
 #     Its firmware (model CubeLite, fw 1.0.0) is WRITE-ONLY. get_prop never
 #     answers, and the SSDP reply is a hardcoded stub that does not change when
 #     the light does, so it cannot be trusted as state. That means `status`
-#     cannot ask this light what it is showing the way it can the Kasa bulb; it
-#     reports the cache and says so. Do not "fix" this by reading SSDP.
+#     cannot ask this light what it is showing; it reports the cache and says
+#     so. Do not "fix" this by reading SSDP.
 #
-#   'kasa' - TP-Link Kasa KL125 ("office 1") over the legacy autokey-XOR
-#     protocol on TCP 9999. No dependencies, no cloud, no credentials. Shows the
-#     aggregate colour only, and can be queried for what it is really showing.
+# GOING DARK. The light is off when there is nothing to report: the Claude
+# desktop app is closed, or no hook has fired in an hour. Neither of those can
+# be noticed by a hook, because the whole point is that nothing is happening and
+# so nothing fires. That is what `watchdog` is for: run it on a schedule (a
+# Scheduled Task every couple of minutes) and it darkens the light when either
+# condition is met, and otherwise re-asserts the current picture.
 #
-#     Note this is the LEGACY protocol. Newer Kasa/Tapo devices speak KLAP over
-#     port 80 and require TP-Link cloud credentials; they will not work here.
+# Recent activity always wins over the app check, so running Claude Code in a
+# terminal with the desktop app closed keeps the light alive rather than
+# blacking it out while work is visibly happening.
 #
-# Usage: status-light.ps1 <red|yellow|green|off|status>
+# Usage: status-light.ps1 <red|yellow|green|off|status|watchdog>
 #
 # Run from a hook, the event JSON arrives on stdin and the colour is recorded
 # against that session's id. Run by hand with no stdin, the colour is forced
@@ -77,14 +88,12 @@
 
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('red', 'yellow', 'green', 'off', 'status')]
+    [ValidateSet('red', 'yellow', 'green', 'off', 'status', 'watchdog')]
     [string]$State
 )
 
 # ---- configuration -------------------------------------------------------
-$Backend    = 'cube'          # 'cube' (Yeelight ClydeCube) or 'kasa' (KL125)
-
-# -- cube backend --
+# -- cube --
 $CubeIp     = '192.168.0.228'
 $CubePort   = 55443
 $CubeColors = @{ red = 0xFF0000; yellow = 0xFFC000; green = 0x00FF00 }
@@ -110,16 +119,10 @@ $SummaryRow = $false
 # room but indistinguishable from the light being broken.
 $IdleDark = $false
 
-# -- kasa backend --
-$BulbIp     = '192.168.0.103'
-$BulbPort   = 9999
 $Brightness = 40          # 1-100. On the cube this scales the pixel values
                           # directly, since direct mode has no separate
                           # brightness control: the RGB you send IS the output.
-$ConnectMs  = 1000        # give up quietly if the bulb is slow or offline
-
-$FlashCount = 0           # pulses on a state change. 0 disables flashing.
-$FlashMs    = 130         # on/off duration per phase, milliseconds
+$ConnectMs  = 1000        # give up quietly if the light is slow or offline
 
 # A session that dies without firing SessionEnd (window closed, crash, reboot)
 # would otherwise pin the light yellow forever. Anything not heard from in this
@@ -128,17 +131,26 @@ $FlashMs    = 130         # on/off duration per phase, milliseconds
 # minutes, with model thinking either side of it.
 $StaleMinutes = 30
 
-# Hue/saturation per state. Set green to @{ hue = 0; sat = 0 } for warm white
-# if you would rather the light stay usable as a room light when idle.
-$Colors = @{
-    red    = @{ hue = 0;   sat = 100 }
-    yellow = @{ hue = 60;  sat = 100 }
-    green  = @{ hue = 120; sat = 100 }
-}
-
 # Worst-wins ordering used to combine the live sessions.
 $Priority = @{ green = 1; yellow = 2; red = 3 }
 
+# -- going dark --
+# No hook in this long and the light goes out. Must be comfortably longer than
+# $StaleMinutes, or slots would still be live on a panel that has gone dark.
+$DarkAfterMinutes = 60
+
+# Activity newer than this means something is genuinely running, which overrides
+# the desktop-app check below. Without it, using Claude Code from a terminal with
+# the app closed would black the light out mid-task.
+$ActiveGraceMinutes = 2
+
+# Darken when the Claude desktop app is not running. Matched on executable path,
+# because the Claude Code CLI is also called claude.exe and must NOT count: the
+# app lives under \WindowsApps\Claude_..., the CLI under AppData\Roaming.
+$RequireAppRunning = $true
+$AppPathMatch = '\\WindowsApps\\Claude'
+
+$ActivityFile = Join-Path $env:TEMP 'claude-status-light.activity'
 $CacheFile = Join-Path $env:TEMP 'claude-status-light.state'   # colour on the bulb
 $StateDir  = Join-Path $env:TEMP 'claude-status-light'         # one file per session
 
@@ -160,93 +172,6 @@ function Write-Trace {
         [System.IO.File]::AppendAllText($TraceFile, ((Get-Date).ToString('HH:mm:ss.fff') + "  pid=$PID  " + $Msg + "`n"))
     }
     catch { }
-}
-
-function ConvertTo-KasaFrame {
-    param([string]$Payload)
-    # TP-Link autokey XOR cipher, initial key 171, 4-byte big-endian length prefix
-    $bytes = [Text.Encoding]::UTF8.GetBytes($Payload)
-    $frame = New-Object byte[] ($bytes.Length + 4)
-    $len = [BitConverter]::GetBytes([int]$bytes.Length)
-    [Array]::Reverse($len)
-    [Array]::Copy($len, 0, $frame, 0, 4)
-    $key = 171
-    for ($i = 0; $i -lt $bytes.Length; $i++) {
-        $key = $key -bxor $bytes[$i]
-        $frame[$i + 4] = $key
-    }
-    return $frame
-}
-
-function Invoke-KasaSequence {
-    # Sends every payload over ONE connection, reading each reply before moving
-    # on. Reading matters: closing the socket straight after a write races the
-    # device and the last command gets dropped.
-    param([string[]]$Payloads, [int[]]$DelaysMs)
-
-    $client = New-Object Net.Sockets.TcpClient
-    try {
-        $ar = $client.BeginConnect($BulbIp, $BulbPort, $null, $null)
-        if (-not $ar.AsyncWaitHandle.WaitOne($ConnectMs)) { return $false }
-        $client.EndConnect($ar)
-        $stream = $client.GetStream()
-        $stream.ReadTimeout = 2000
-
-        for ($p = 0; $p -lt $Payloads.Count; $p++) {
-            $frame = ConvertTo-KasaFrame -Payload $Payloads[$p]
-            $stream.Write($frame, 0, $frame.Length)
-            $stream.Flush()
-
-            # drain the reply so the command is known to have landed
-            $hdr = New-Object byte[] 4
-            $got = 0
-            while ($got -lt 4) {
-                $n = $stream.Read($hdr, $got, 4 - $got)
-                if ($n -le 0) { return $false }
-                $got += $n
-            }
-            [Array]::Reverse($hdr)
-            $rlen = [BitConverter]::ToInt32($hdr, 0)
-            if ($rlen -gt 0 -and $rlen -lt 65536) {
-                $rbuf = New-Object byte[] $rlen
-                $got = 0
-                while ($got -lt $rlen) {
-                    $n = $stream.Read($rbuf, $got, $rlen - $got)
-                    if ($n -le 0) { break }
-                    $got += $n
-                }
-            }
-
-            if ($null -ne $DelaysMs -and $p -lt $DelaysMs.Count -and $DelaysMs[$p] -gt 0) {
-                Start-Sleep -Milliseconds $DelaysMs[$p]
-            }
-        }
-        return $true
-    }
-    finally {
-        $client.Close()
-    }
-}
-
-function Get-ColorPayload {
-    param([string]$State)
-    $c = $Colors[$State]
-    '{"smartlife.iot.smartbulb.lightingservice":{"transition_light_state":{' +
-    '"ignore_default":1,"on_off":1,"mode":"normal",' +
-    '"hue":' + $c.hue + ',"saturation":' + $c.sat + ',' +
-    '"brightness":' + $Brightness + ',"color_temp":0,"transition_period":0}}}'
-}
-
-function Get-OffPayload {
-    '{"smartlife.iot.smartbulb.lightingservice":{"transition_light_state":{"ignore_default":1,"on_off":0,"transition_period":0}}}'
-}
-
-function ConvertFrom-KasaFrame {
-    param([byte[]]$Buf)
-    $key = 171
-    $out = New-Object byte[] $Buf.Length
-    for ($i = 0; $i -lt $Buf.Length; $i++) { $out[$i] = $Buf[$i] -bxor $key; $key = $Buf[$i] }
-    return [Text.Encoding]::UTF8.GetString($out)
 }
 
 function Send-Yeelight {
@@ -464,83 +389,51 @@ function Show-Status {
     $tasks = @(Get-RunningTasks)
     if ($tasks.Count -eq 0) { "  (none)" } else { $tasks | ForEach-Object { "  $_" } }
 
+    $last = Get-LastActivity
+    if ($null -eq $last) { "activity  : never recorded" }
+    else { "activity  : {0:HH:mm:ss}, {1:n1} min ago" -f $last, ((Get-Date) - $last).TotalMinutes }
+    "app       : " + $(if (Test-AppRunning) { 'desktop app running' } else { 'desktop app NOT running' })
+    $reason = Get-DarkReason
+    "dark      : " + $(if ($null -ne $reason) { "YES - $reason" } else { 'no' })
+
     $pic = Get-Picture
     "aggregate : " + $pic.Aggregate
     "cache     : " + $(if (Test-Path $CacheFile) { (Get-Content $CacheFile -Raw -ErrorAction SilentlyContinue).Trim() } else { '(none)' })
-    "backend   : " + $Backend
 
-    # What the light is being asked to render, which for the cube is not the
-    # same thing as the aggregate.
-    if ($Backend -eq 'cube') {
-        $states = @($pic.Slots | ForEach-Object { $_.State })
-        $n = $states.Count
-        if ($n -eq 0) { "display   : all off (no live sessions)" }
-        else {
-            $rows = $MatrixH - $(if ($SummaryRow) { 1 } else { 0 })
-            $unit = if ($n -le $MatrixW) { 'col' } else { 'px' }
-            $total = if ($n -le $MatrixW) { $MatrixW } else { $MatrixW * $rows }
-            $spans = Get-Spans -Count $n -Total $total
-            $desc = (0..($n - 1) | ForEach-Object { "" + $states[$_] + '=' + $spans[$_][1] + $unit }) -join ', '
-            $gapped = if (($n + ($GapUnits * ($n - 1))) -le $total) { 'with gaps' } else { 'no room for gaps' }
-            "display   : $n block(s) left to right, $gapped"
-            "            $desc"
-            if ($SummaryRow) { "            top row = worst state summary" }
-        }
+    # What the panel is being asked to render, which is not the same thing as
+    # the aggregate.
+    $states = @($pic.Slots | ForEach-Object { $_.State })
+    $n = $states.Count
+    if ($n -eq 0) { "display   : all off (no live sessions)" }
+    else {
+        $rows = $MatrixH - $(if ($SummaryRow) { 1 } else { 0 })
+        $unit = if ($n -le $MatrixW) { 'col' } else { 'px' }
+        $total = if ($n -le $MatrixW) { $MatrixW } else { $MatrixW * $rows }
+        $spans = Get-Spans -Count $n -Total $total
+        $desc = (0..($n - 1) | ForEach-Object { "" + $states[$_] + '=' + $spans[$_][1] + $unit }) -join ', '
+        $gapped = if (($n + ($GapUnits * ($n - 1))) -le $total) { 'with gaps' } else { 'no room for gaps' }
+        "display   : $n block(s) left to right, oldest first, $gapped"
+        "            $desc"
+        if ($SummaryRow) { "            top row = worst state summary" }
     }
 
-    if ($Backend -eq 'cube') {
-        # This firmware cannot be asked what it is showing: get_prop never
-        # answers and its SSDP reply is a hardcoded stub. Reachability is the
-        # only thing that can honestly be checked, so check that and say so.
-        $c = New-Object Net.Sockets.TcpClient
-        try {
-            $ar = $c.BeginConnect($CubeIp, $CubePort, $null, $null)
-            if (-not $ar.AsyncWaitHandle.WaitOne($ConnectMs)) {
-                "cube      : UNREACHABLE at $CubeIp`:$CubePort (LAN Control off, or offline)"
-            }
-            else {
-                $c.EndConnect($ar)
-                "cube      : reachable at $CubeIp`:$CubePort"
-                "            (write-only firmware: cannot read back what it is showing)"
-            }
-        }
-        catch { "cube      : error talking to $CubeIp - $($_.Exception.Message)" }
-        finally { $c.Close() }
-        return
-    }
-
-    # Ask the bulb what it is actually showing. The cache is only a belief, and
-    # a silent failure (bulb offline, address reused by another device) shows up
-    # here as the two disagreeing.
-    $client = New-Object Net.Sockets.TcpClient
+    # This firmware cannot be asked what it is showing: get_prop never answers
+    # and its SSDP reply is a hardcoded stub. Reachability is the only thing
+    # that can honestly be checked, so check that and say so.
+    $c = New-Object Net.Sockets.TcpClient
     try {
-        $ar = $client.BeginConnect($BulbIp, $BulbPort, $null, $null)
-        if (-not $ar.AsyncWaitHandle.WaitOne($ConnectMs)) { "bulb      : UNREACHABLE at $BulbIp`:$BulbPort"; return }
-        $client.EndConnect($ar)
-        $stream = $client.GetStream()
-        $stream.ReadTimeout = 2000
-        $frame = ConvertTo-KasaFrame -Payload '{"system":{"get_sysinfo":{}}}'
-        $stream.Write($frame, 0, $frame.Length)
-        $stream.Flush()
-
-        $hdr = New-Object byte[] 4; $got = 0
-        while ($got -lt 4) { $n = $stream.Read($hdr, $got, 4 - $got); if ($n -le 0) { break }; $got += $n }
-        [Array]::Reverse($hdr)
-        $rlen = [BitConverter]::ToInt32($hdr, 0)
-        $rbuf = New-Object byte[] $rlen; $got = 0
-        while ($got -lt $rlen) { $n = $stream.Read($rbuf, $got, $rlen - $got); if ($n -le 0) { break }; $got += $n }
-        $info = (ConvertFrom-Json (ConvertFrom-KasaFrame -Buf $rbuf)).system.get_sysinfo
-        $ls = $info.light_state
-        if ($ls.on_off -eq 0) { "bulb      : {0} is OFF" -f $info.alias }
+        $ar = $c.BeginConnect($CubeIp, $CubePort, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($ConnectMs)) {
+            "cube      : UNREACHABLE at $CubeIp`:$CubePort (LAN Control off, or offline)"
+        }
         else {
-            $name = 'hue ' + $ls.hue
-            foreach ($k in $Colors.Keys) { if ($Colors[$k].hue -eq $ls.hue -and $Colors[$k].sat -eq $ls.saturation) { $name = $k } }
-            if ($ls.saturation -eq 0) { $name = 'white' }
-            "bulb      : {0} is showing {1}" -f $info.alias, $name
+            $c.EndConnect($ar)
+            "cube      : reachable at $CubeIp`:$CubePort"
+            "            (write-only firmware: cannot read back what it is showing)"
         }
     }
-    catch { "bulb      : error talking to $BulbIp - $($_.Exception.Message)" }
-    finally { $client.Close() }
+    catch { "cube      : error talking to $CubeIp - $($_.Exception.Message)" }
+    finally { $c.Close() }
 }
 
 function Get-HookEvent {
@@ -632,6 +525,47 @@ function Get-RunningTasks {
     return $found
 }
 
+function Update-Activity {
+    # Touched on every hook event, whatever it asked for. This is the only
+    # record of "something happened", and it has to survive SessionEnd deleting
+    # the last slot, so it cannot be derived from the slot files.
+    try { [System.IO.File]::WriteAllText($ActivityFile, (Get-Date).Ticks.ToString()) }
+    catch { }
+}
+
+function Get-LastActivity {
+    try {
+        $fi = Get-Item -LiteralPath $ActivityFile -ErrorAction Stop
+        return $fi.LastWriteTime
+    }
+    catch { return $null }
+}
+
+function Test-AppRunning {
+    # The desktop app only. Get-Process is used rather than CIM because this runs
+    # on a schedule and Win32_Process is markedly slower; .Path throws for
+    # processes owned by another user, which simply means it is not ours.
+    foreach ($p in @(Get-Process -Name 'claude' -ErrorAction SilentlyContinue)) {
+        try { if ($p.Path -match $AppPathMatch) { return $true } } catch { }
+    }
+    return $false
+}
+
+function Get-DarkReason {
+    # $null to show the normal picture, otherwise why the light should be off.
+    $last = Get-LastActivity
+    if ($null -eq $last) { return 'no activity ever recorded' }
+
+    $idle = ((Get-Date) - $last).TotalMinutes
+    # Something is actively running: that outranks everything, including the app
+    # check, so a terminal session with the app closed still lights the panel.
+    if ($idle -le $ActiveGraceMinutes) { return $null }
+
+    if ($RequireAppRunning -and -not (Test-AppRunning)) { return 'desktop app closed' }
+    if ($idle -ge $DarkAfterMinutes) { return ('idle {0:n0} min' -f $idle) }
+    return $null
+}
+
 function Get-Picture {
     # The whole state of the world in one pass: one slot per live session,
     # ordered stably by session key so the cycle does not reshuffle between hook
@@ -644,7 +578,10 @@ function Get-Picture {
     $best = 'green'
     $cut = (Get-Date).AddMinutes(-$StaleMinutes)
 
-    $files = @(Get-ChildItem -LiteralPath $StateDir -Filter '*.state' -File -ErrorAction SilentlyContinue | Sort-Object Name)
+    # Oldest first: CreationTime is when the session fired its FIRST hook, and
+    # Set-Content on an existing file leaves it alone, so a session holds its
+    # position for life. Name breaks ties so the order is never arbitrary.
+    $files = @(Get-ChildItem -LiteralPath $StateDir -Filter '*.state' -File -ErrorAction SilentlyContinue | Sort-Object CreationTime, Name)
     foreach ($f in $files) {
         if ($f.LastWriteTime -lt $cut) {
             Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
@@ -690,7 +627,6 @@ function Get-CacheKey {
     # to three is a real change that a bare 'yellow' would hide.
     param([string]$Want, $Slots)
 
-    if ($Backend -ne 'cube') { return $Want }
     if ($Want -eq 'off') { return 'cube:off' }
     $states = @()
     if ($null -ne $Slots) { $states = @($Slots | ForEach-Object { $_.State }) }
@@ -719,15 +655,9 @@ function Set-Light {
     }
     Set-Content -Path $CacheFile -Value $key -NoNewline
 
-    $ok = $false
-    if ($Backend -eq 'cube') {
-        $states = @()
-        if ($null -ne $Slots) { $states = @($Slots | ForEach-Object { $_.State }) }
-        $ok = Set-Cube -States $states -Aggregate $Want
-    }
-    else {
-        $ok = Set-Kasa -Want $Want
-    }
+    $states = @()
+    if ($null -ne $Slots) { $states = @($Slots | ForEach-Object { $_.State }) }
+    $ok = Set-Cube -States $states -Aggregate $Want
 
     if (-not $ok) {
         # Light unreachable: undo the claim so the next hook retries rather than
@@ -737,30 +667,35 @@ function Set-Light {
     }
 }
 
-function Set-Kasa {
-    param([string]$Want)
+if ($State -eq 'status') { Show-Status; exit 0 }
 
-    # Build the whole sequence up front: settle on the new colour, then pulse it.
-    $payloads = New-Object System.Collections.Generic.List[string]
-    $delays = New-Object System.Collections.Generic.List[int]
-
-    if ($Want -eq 'off') {
-        $payloads.Add((Get-OffPayload)); $delays.Add(0)
-    }
-    else {
-        $color = Get-ColorPayload -State $Want
-        $off = Get-OffPayload
-        $payloads.Add($color); $delays.Add($(if ($FlashCount -gt 0) { $FlashMs } else { 0 }))
-        for ($i = 0; $i -lt $FlashCount; $i++) {
-            $payloads.Add($off);   $delays.Add($FlashMs)
-            $payloads.Add($color); $delays.Add($(if ($i -lt ($FlashCount - 1)) { $FlashMs } else { 0 }))
+if ($State -eq 'watchdog') {
+    # Run on a schedule. Nothing else can notice the app closing or the room
+    # going quiet, because both are the absence of hook events.
+    $mtx = New-Object System.Threading.Mutex($false, 'ClaudeStatusLight')
+    $held = $false
+    try {
+        try { $held = $mtx.WaitOne(3000) } catch { $held = $false }
+        $reason = Get-DarkReason
+        if ($null -ne $reason) {
+            Write-Trace ("watchdog: dark ($reason)")
+            Set-Light -Want 'off' -Slots $null
+        }
+        else {
+            # Not dark: re-assert the picture. Cheap, because Set-Light skips
+            # the write when the composition is unchanged, and it repaints the
+            # panel if the light was power-cycled or darkened behind our back.
+            $pic = Get-Picture
+            Set-Light -Want $pic.Aggregate -Slots $pic.Slots
         }
     }
-
-    return (Invoke-KasaSequence -Payloads $payloads.ToArray() -DelaysMs $delays.ToArray())
+    catch { Write-Trace ('watchdog EXCEPTION: ' + $_.Exception.Message) }
+    finally {
+        if ($held) { $mtx.ReleaseMutex() }
+        $mtx.Dispose()
+    }
+    exit 0
 }
-
-if ($State -eq 'status') { Show-Status; exit 0 }
 
 try {
     Write-Trace ("ENTER state=$State temp=$env:TEMP")
@@ -790,6 +725,7 @@ try {
             Set-Light -Want 'off' -Slots $null
         }
         else {
+            Update-Activity
             Set-SessionState -Key $key -Want $State -Ended ($hookName -eq 'SessionEnd')
             $pic = Get-Picture
             Write-Trace ("slots=[" + (($pic.Slots | ForEach-Object { $_.Key + '=' + $_.State }) -join ' ') + "] agg=" + $pic.Aggregate)
