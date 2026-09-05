@@ -36,7 +36,7 @@
 # is noticeable when other lights are on. A repeat of the current state does
 # nothing at all (see the cache note below).
 #
-# Backend: a Yeelight Cube Smart Lamp Lite "ClydeCube" at 192.168.0.228,
+# Backend: a Yeelight Cube Smart Lamp Lite "ClydeCube" at 192.168.0.105,
 # Yeelight LAN Control on TCP 55443. A 20x5 RGB matrix, driven per pixel, one
 # block per session.
 #
@@ -103,7 +103,7 @@ param(
 
 # ---- configuration -------------------------------------------------------
 # -- cube --
-$CubeIp     = '192.168.0.228'
+$CubeIp     = '192.168.0.105'   # DHCP reservation for E4:B3:23:0D:47:50
 $CubePort   = 55443
 $CubeColors = @{ red = 0xFF0000; yellow = 0xFFC000; green = 0x00FF00 }
 
