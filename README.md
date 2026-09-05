@@ -37,6 +37,11 @@ Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Wind
 | 🟢 green | finished, ready for a new task | `Stop`, `SessionStart`, `SessionEnd` |
 | ⬛ dark | nothing running at all | see **Going dark** |
 
+A session earns its block on the first hook that means something is *happening*.
+`SessionStart` deliberately does not create one: reopening the desktop app restores every
+previous conversation tab and each fires `SessionStart`, which otherwise planted a green
+block per restored tab and showed three sessions when only one was in use.
+
 `$SummaryRow` (on) reserves the top row as a full-width bar showing the worst state
 across every session, with the per-session blocks filling the four rows beneath: one red
 pixel among a hundred is easy to miss, a red stripe across the top is not.

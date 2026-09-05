@@ -24,6 +24,9 @@
 # green). It is what fills the panel when nothing is running, and what `status`
 # reports. Green has to mean "nothing is running anywhere".
 #
+# A session appears on the panel when it first DOES something, not when it is
+# created: SessionStart deliberately does not open a slot. See Set-SessionState.
+#
 # "Working" includes backgrounded commands. A session that launches a test suite
 # with run_in_background and then ends its turn fires Stop, but the suite is
 # still running and the light must stay yellow until it finishes. See
@@ -472,14 +475,28 @@ function Get-SessionKey {
 function Set-SessionState {
     # SessionEnd retires the slot outright: an ended session must not hold the
     # light at anything, not even green.
-    param([string]$Key, [string]$Want, [bool]$Ended)
-    if (-not (Test-Path -LiteralPath $StateDir)) {
-        New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
-    }
+    #
+    # SessionStart does NOT open one, which is the less obvious half. Reopening
+    # the desktop app restores every previous conversation tab and each fires
+    # SessionStart, which planted a green slot per restored tab: the panel showed
+    # three sessions when only one was in use. A session that exists but has
+    # never done anything is not work to report. It earns its block on the first
+    # hook that means something is happening, and keeps it until SessionEnd.
+    #
+    # SessionStart still UPDATES a slot that already exists, rather than being
+    # ignored outright, so it can never strand a stale colour.
+    param([string]$Key, [string]$Want, [string]$HookName)
+
     $f = Join-Path $StateDir ($Key + '.state')
-    if ($Ended) {
+
+    if ($HookName -eq 'SessionEnd') {
         Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
         return
+    }
+    if ($HookName -eq 'SessionStart' -and -not (Test-Path -LiteralPath $f)) { return }
+
+    if (-not (Test-Path -LiteralPath $StateDir)) {
+        New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
     }
     Set-Content -LiteralPath $f -Value $Want -NoNewline
 }
@@ -736,7 +753,7 @@ try {
         }
         else {
             Update-Activity
-            Set-SessionState -Key $key -Want $State -Ended ($hookName -eq 'SessionEnd')
+            Set-SessionState -Key $key -Want $State -HookName $hookName
             $pic = Get-Picture
             Write-Trace ("slots=[" + (($pic.Slots | ForEach-Object { $_.Key + '=' + $_.State }) -join ' ') + "] agg=" + $pic.Aggregate)
             Set-Light -Want $pic.Aggregate -Slots $pic.Slots
