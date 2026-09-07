@@ -289,5 +289,6 @@ $('save').onclick = async () => {
 
 setMode('session');
 loadLayout().then(loadFrames);
-setInterval(loadLayout, 5000);
+// Every 8s, not 5: each poll costs a PowerShell start on the server side.
+setInterval(loadLayout, 8000);
 </script>

@@ -51,7 +51,12 @@ POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 # status-light.ps1 layout costs a PowerShell start (~300ms). The editor polls,
 # so it is cached briefly; short enough that adding a session still feels live.
-LAYOUT_TTL = 2.0
+LAYOUT_TTL = 6.0
+
+# pythonw has no console of its own, so without this flag every PowerShell child
+# creates ONE, and a console window flashes on screen for each call. The editor
+# polls, so that was several visible flashes a minute.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 _layout_lock = threading.Lock()
 _layout_cache = {"at": 0.0, "value": None}
@@ -83,6 +88,7 @@ def run_status_light(verb, timeout=25):
             [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-File", STATUS_LIGHT, verb],
             capture_output=True, text=True, timeout=timeout,
+            creationflags=NO_WINDOW,
         )
         return p.returncode == 0, p.stdout, p.stderr
     except Exception as e:
