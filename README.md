@@ -194,7 +194,16 @@ quietly grow the scan forever. The watcher runs it once a day.
 |---|---|---|
 | last session ends | immediate | `$IdleDark`, on the hook itself |
 | desktop app closes | ~2 seconds | `watch-app.ps1` polling the process table |
-| nothing run for `$DarkAfterMinutes` (20) | ~20 seconds | `status-light.ps1 watchdog` |
+| every session idle for `$DarkAfterMinutes` (20) | ~20 seconds | `status-light.ps1 watchdog` |
+
+**The idle timeout never applies while any session is yellow or red.** Quiet is not the
+same as finished: a session running a long background task fires no hooks while it runs,
+and a session waiting on confirmation fires one and then nothing until it is answered.
+Timing either out would turn the light off exactly when it has something to say. Those
+slots also survive far longer before the staleness sweep forgets them
+(`$StaleMinutesActive`, 240, against `$StaleMinutes`, 30, for an idle one) — still bounded,
+so a session that dies mid-prompt cannot pin the panel red forever. An app close still
+darkens regardless, since with the app gone there is nobody to answer the prompt anyway.
 
 None of it can be driven by hooks, because all three conditions *are* the absence of
 hook events: if nothing is running, nothing fires, and the panel would sit showing the

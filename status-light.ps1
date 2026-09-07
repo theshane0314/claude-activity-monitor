@@ -162,12 +162,23 @@ $ConnectMs  = 1000        # give up quietly if the light is slow or offline
 # minutes, with model thinking either side of it.
 $StaleMinutes = 30
 
+# ...but only for a session that is IDLE. A session that is working, or waiting
+# on an answer, keeps its slot this much longer. Red is the case that matters:
+# it fires one hook and then sits silent until you answer it, so the ordinary
+# sweep would drop the slot and turn the light off on the one state that most
+# needs to stay visible. Still bounded, so a session that dies mid-prompt cannot
+# pin the panel red forever.
+$StaleMinutesActive = 240
+
 # Worst-wins ordering used to combine the live sessions.
 $Priority = @{ green = 1; yellow = 2; red = 3 }
 
 # -- going dark --
-# No hook in this long and the light goes out. Must be comfortably longer than
-# $StaleMinutes, or slots would still be live on a panel that has gone dark.
+# No hook in this long and the light goes out -- but ONLY if every session is
+# idle. A yellow or red session is never timed out, however long it has been
+# quiet: a long background task and a prompt waiting for an answer both produce
+# no hooks at all, and going dark on either would hide exactly what the panel
+# exists to show. See Get-DarkReason.
 $DarkAfterMinutes = 20
 
 # Activity newer than this means something is genuinely running, which overrides
@@ -497,7 +508,10 @@ function Show-Status {
     foreach ($f in @(Get-ChildItem -LiteralPath $StateDir -Filter '*.state' -File -ErrorAction SilentlyContinue)) {
         $any = $true
         $age = ((Get-Date) - $f.LastWriteTime).TotalMinutes
-        $stale = if ($age -gt $StaleMinutes) { '  STALE, ignored' } else { '' }
+        $slotState = (Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue)
+        if ($null -ne $slotState) { $slotState = $slotState.Trim() }
+        $limit = if ($slotState -eq 'green') { $StaleMinutes } else { $StaleMinutesActive }
+        $stale = if ($age -gt $limit) { "  STALE (>$limit min), ignored" } else { '' }
         "  {0}  {1,-7}  last hook {2:n1} min ago{3}" -f $f.BaseName.Substring(0, [Math]::Min(8, $f.BaseName.Length)), (Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue), $age, $stale
     }
     if (-not $any) { "  (none)" }
@@ -725,7 +739,20 @@ function Get-DarkReason {
     if ($idle -le $ActiveGraceMinutes) { return $null }
 
     if ($RequireAppRunning -and -not (Test-AppRunning)) { return 'desktop app closed' }
-    if ($idle -ge $DarkAfterMinutes) { return ('idle {0:n0} min' -f $idle) }
+
+    if ($idle -ge $DarkAfterMinutes) {
+        # Quiet is not the same as finished. A session running a long background
+        # task fires no hooks while it runs, and a session waiting on
+        # confirmation fires one and then nothing until it is answered. Timing
+        # either out would turn the light off precisely when it has something to
+        # say, so the idle timeout only applies when every session is green.
+        #
+        # The app-closed check above still wins: if the app is gone there is
+        # nobody to answer the prompt anyway.
+        $agg = (Get-Picture).Aggregate
+        if ($agg -ne 'green') { return $null }
+        return ('idle {0:n0} min' -f $idle)
+    }
     return $null
 }
 
@@ -766,21 +793,28 @@ function Get-Picture {
     # The whole state of the world in one pass: one slot per live session,
     # ordered oldest first, plus the worst-wins aggregate over all of them.
     $slots = New-Object System.Collections.Generic.List[object]
-    $cut = (Get-Date).AddMinutes(-$StaleMinutes)
+    $cutIdle = (Get-Date).AddMinutes(-$StaleMinutes)
+    $cutActive = (Get-Date).AddMinutes(-$StaleMinutesActive)
 
     # Oldest first: CreationTime is when the session fired its FIRST hook, and
     # Set-Content on an existing file leaves it alone, so a session holds its
     # position for life. Name breaks ties so the order is never arbitrary.
     $files = @(Get-ChildItem -LiteralPath $StateDir -Filter '*.state' -File -ErrorAction SilentlyContinue | Sort-Object CreationTime, Name)
     foreach ($f in $files) {
-        if ($f.LastWriteTime -lt $cut) {
-            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
-            continue
-        }
+        # Read BEFORE deciding to sweep: how long a slot may sit silent depends
+        # on what it says. An idle session is forgotten after $StaleMinutes, but
+        # a working or waiting one is kept for $StaleMinutesActive, because
+        # silence is what those states look like from the outside.
         $s = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
         if ($null -eq $s) { continue }
         $s = $s.Trim()
         if (-not $Priority.ContainsKey($s)) { continue }
+
+        $cut = if ($s -eq 'green') { $cutIdle } else { $cutActive }
+        if ($f.LastWriteTime -lt $cut) {
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+            continue
+        }
         $slots.Add([pscustomobject]@{
                 Key   = $f.BaseName.Substring(0, [Math]::Min(8, $f.BaseName.Length))
                 State = $s
