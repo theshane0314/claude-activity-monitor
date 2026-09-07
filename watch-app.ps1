@@ -23,7 +23,8 @@
 param(
     [int]$PollSeconds = 2,        # how fast an app close is noticed
     [int]$IdleCheckSeconds = 20,  # how often the full dark check runs
-    [int]$PruneHours = 24         # how often stale task .output files are swept
+    [int]$PruneHours = 24,        # how often stale task .output files are swept
+    [int]$ServerCheckSeconds = 30 # how often clyde-server is confirmed alive
 )
 
 $ErrorActionPreference = 'Continue'
@@ -32,6 +33,13 @@ $Script = Join-Path $PSScriptRoot 'status-light.ps1'
 if (-not (Test-Path -LiteralPath $Script)) { throw "status-light.ps1 not found next to this script ($Script)" }
 
 $AppPathMatch = '\\WindowsApps\\Claude'
+
+# clyde-server.py serves the pixel editor. It is supervised from here rather
+# than given its own Scheduled Task, so there is one thing to start and one
+# thing to restart.
+$ServerScript = Join-Path $PSScriptRoot 'clyde-server.py'
+$ServerPort = 8787
+$PythonW = 'C:\Users\Shane-PC\AppData\Local\Programs\Python\Python313\pythonw.exe'
 $TraceFile = Join-Path $env:TEMP 'claude-status-light-trace.log'
 
 function Write-Trace {
@@ -49,6 +57,33 @@ function Test-AppRunning {
         try { if ($p.Path -match $AppPathMatch) { return $true } } catch { }
     }
     return $false
+}
+
+function Test-ServerUp {
+    # The port is the honest test: a python process that is alive but wedged
+    # before binding is not serving anything.
+    $c = New-Object Net.Sockets.TcpClient
+    try {
+        $ar = $c.BeginConnect('127.0.0.1', $ServerPort, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne(600)) { return $false }
+        $c.EndConnect($ar)
+        return $true
+    }
+    catch { return $false }
+    finally { $c.Close() }
+}
+
+function Start-Server {
+    if (-not (Test-Path -LiteralPath $ServerScript)) { return }
+    $exe = if (Test-Path -LiteralPath $PythonW) { $PythonW } else { 'pythonw.exe' }
+    try {
+        # pythonw, not python: python.exe would flash a console window every
+        # time the supervisor restarted it.
+        Start-Process -FilePath $exe -ArgumentList "`"$ServerScript`"" `
+            -WindowStyle Hidden -WorkingDirectory $PSScriptRoot | Out-Null
+        Write-Trace "started clyde-server ($exe)"
+    }
+    catch { Write-Trace ('could not start clyde-server: ' + $_.Exception.Message) }
 }
 
 function Invoke-StatusLight {
@@ -77,6 +112,7 @@ try {
     # First prune one interval from now, not at startup: the watcher is
     # restarted by the supervisor and should not sweep on every restart.
     $lastPrune = Get-Date
+    $lastServerCheck = (Get-Date).AddYears(-1)   # check immediately on startup
 
     while ($true) {
         Start-Sleep -Seconds $PollSeconds
@@ -104,6 +140,16 @@ try {
         if (((Get-Date) - $lastIdleCheck).TotalSeconds -ge $IdleCheckSeconds) {
             $lastIdleCheck = Get-Date
             Invoke-StatusLight -Verb 'watchdog'
+        }
+
+        # Keep the editor's server alive. Cheap: a loopback connect, and a
+        # start only when it is actually down.
+        if (((Get-Date) - $lastServerCheck).TotalSeconds -ge $ServerCheckSeconds) {
+            $lastServerCheck = Get-Date
+            if (-not (Test-ServerUp)) {
+                Write-Trace 'clyde-server not listening, starting it'
+                Start-Server
+            }
         }
 
         # Sweep stale task output files. Claude Code appears to clean up at about

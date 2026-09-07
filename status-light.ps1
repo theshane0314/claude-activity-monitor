@@ -655,6 +655,18 @@ function Show-Status {
     if ($n -eq 0) { "display   : all off (no live sessions)" }
     else {
         $avail = $MatrixH - $(if ($SummaryRow) { 1 } else { 0 })
+
+        # The manual drawing is part of what is on the panel, so it has to be
+        # part of what `status` describes. Reporting the session count alone
+        # would disagree with the panel whenever a drawing is up.
+        $ovs = Get-Override -States $states
+        if ($null -ne $ovs -and $ovs.mode -eq 'takeover') {
+            "display   : manual drawing, whole panel ($($ovs.w)x$($ovs.h))"
+            "            clears when the session composition changes"
+            return
+        }
+        if ($null -ne $ovs -and $ovs.mode -eq 'session') { $n++ }
+
         $grid = Get-Grid -Count $n
         $cols = $grid[0]; $gridRows = [Math]::Min($grid[1], $avail)
         $xs = Get-Spans -Count $cols -Total $MatrixW
@@ -666,7 +678,8 @@ function Show-Status {
             $row = @()
             for ($c = 0; $c -lt $cols; $c++) {
                 $i = ($r * $cols) + $c
-                $row += $(if ($i -lt $n) { $states[$i] } else { '-' })
+                $row += $(if ($i -lt $states.Count) { $states[$i] }
+                    elseif ($i -lt $n) { 'DRAWING' } else { '-' })
             }
             "            [" + ($row -join ' ') + "]"
         }

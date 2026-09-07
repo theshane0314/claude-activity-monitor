@@ -1,0 +1,293 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClydeCube</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2c313b; --ink: #e6e9ef;
+    --dim: #98a0ae; --accent: #FF7000; --ok: #00FF64; --bad: #ff4d4d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    padding: 14px; -webkit-text-size-adjust: 100%;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -.01em; font-weight: 650; }
+  .sub { color: var(--dim); font-size: 11px; margin-bottom: 16px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px; margin-bottom: 12px;
+  }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row + .row { margin-top: 8px; }
+  label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  button, select, input[type=text] {
+    background: #262b34; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; padding: 7px 11px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: #444c5a; }
+  button.on { background: var(--accent); border-color: var(--accent); color: #1a1206; font-weight: 600; }
+  button.danger:hover { border-color: var(--bad); color: var(--bad); }
+  input[type=text] { cursor: text; min-width: 130px; }
+  input[type=color] {
+    width: 44px; height: 34px; padding: 2px; background: #262b34;
+    border: 1px solid var(--line); border-radius: 7px; cursor: pointer;
+  }
+
+  /* The grid is the point, so it gets the room. aspect-ratio keeps the cube's
+     proportions whatever the canvas size turns out to be. */
+  #grid {
+    display: grid; gap: 2px; width: 100%; margin: 0 auto;
+    background: #0c0e11; padding: 6px; border-radius: 8px;
+    touch-action: none; user-select: none;
+  }
+  #grid div {
+    aspect-ratio: 1; border-radius: 3px; background: #000;
+    box-shadow: inset 0 0 0 1px #ffffff08;
+  }
+  .swatches { display: flex; gap: 6px; flex-wrap: wrap; }
+  .sw {
+    width: 30px; height: 30px; border-radius: 6px; cursor: pointer;
+    border: 2px solid transparent;
+  }
+  .sw.sel { border-color: #fff; }
+  .msg { font-size: 11px; margin-top: 8px; min-height: 16px; }
+  .msg.err { color: var(--bad); }
+  .msg.ok { color: var(--ok); }
+  .pill {
+    font-size: 11px; padding: 3px 8px; border-radius: 99px;
+    background: #262b34; color: var(--dim); border: 1px solid var(--line);
+  }
+  .frames { display: flex; flex-direction: column; gap: 5px; max-height: 190px; overflow: auto; }
+  .frames .f { display: flex; gap: 6px; align-items: center; }
+  .frames .f span { flex: 1; }
+  .frames .f small { color: var(--dim); font-size: 11px; }
+  /* One scroll region only: the frame list scrolls internally, the page does not
+     grow a second bar for it. */
+  .frames { scrollbar-width: thin; scrollbar-color: #3a4150 transparent; }
+  .frames::-webkit-scrollbar { width: 7px; }
+  .frames::-webkit-scrollbar-track { background: transparent; }
+  .frames::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 4px; }
+</style>
+
+<h1>ClydeCube</h1>
+<div class="sub" id="status">connecting…</div>
+
+<div class="card">
+  <div class="row">
+    <label>Mode</label>
+    <button id="mSession" class="on">As a session</button>
+    <button id="mTakeover">Whole panel</button>
+    <span class="pill" id="canvasSize">no canvas yet</span>
+  </div>
+  <div class="row" id="modeHelp" style="color:var(--dim);font-size:11px"></div>
+</div>
+
+<div class="card">
+  <div id="grid"></div>
+  <div class="row" style="margin-top:10px">
+    <input type="color" id="colour" value="#ff7000">
+    <div class="swatches" id="swatches"></div>
+  </div>
+  <div class="row">
+    <button id="fill">Fill all</button>
+    <button id="clear">Clear</button>
+    <button id="pick" title="Click a pixel to copy its colour">Eyedropper</button>
+    <button id="erase">Eraser</button>
+  </div>
+  <div class="row">
+    <button id="send" class="on" style="flex:1">Show on cube</button>
+    <button id="revert" class="danger">Hand back to Claude</button>
+  </div>
+  <div class="msg" id="msg"></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <input type="text" id="fname" placeholder="frame name">
+    <button id="save">Save frame</button>
+  </div>
+  <div class="row" style="margin-top:10px"><label>Saved frames</label></div>
+  <div class="frames" id="frames"></div>
+</div>
+
+<script>
+const API = location.origin;
+let W = 20, H = 5, mode = 'session', px = [], tool = 'paint';
+let layout = null, painting = false;
+
+const $ = id => document.getElementById(id);
+const hex2rgb = h => [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
+const rgb2hex = c => '#' + c.map(v => v.toString(16).padStart(2,'0')).join('');
+
+function say(t, cls='') { const m = $('msg'); m.textContent = t; m.className = 'msg ' + cls; }
+
+function buildGrid() {
+  const g = $('grid');
+  g.style.gridTemplateColumns = `repeat(${W}, 1fr)`;
+  g.innerHTML = '';
+  for (let i = 0; i < W * H; i++) {
+    const d = document.createElement('div');
+    d.dataset.i = i;
+    g.appendChild(d);
+  }
+  paintAll();
+  $('canvasSize').textContent = `${W} x ${H}`;
+}
+
+function paintAll() {
+  const kids = $('grid').children;
+  for (let i = 0; i < px.length; i++) kids[i].style.background = rgb2hex(px[i]);
+}
+
+function resize(w, h) {
+  const old = px, ow = W, oh = H;
+  W = w; H = h;
+  px = Array.from({length: W*H}, () => [0,0,0]);
+  // Keep whatever still fits, so switching mode does not silently bin the drawing.
+  if (old.length) {
+    for (let y = 0; y < Math.min(h, oh); y++)
+      for (let x = 0; x < Math.min(w, ow); x++)
+        px[y*W + x] = old[y*ow + x];
+  }
+  buildGrid();
+}
+
+function apply(i) {
+  if (i < 0 || i >= px.length) return;
+  if (tool === 'pick') {
+    $('colour').value = rgb2hex(px[i]);
+    tool = 'paint'; $('pick').classList.remove('on');
+    return;
+  }
+  px[i] = tool === 'erase' ? [0,0,0] : hex2rgb($('colour').value);
+  $('grid').children[i].style.background = rgb2hex(px[i]);
+}
+
+// Pointer events so it works with a mouse and with a finger on the HA app.
+$('grid').addEventListener('pointerdown', e => {
+  const t = e.target.closest('div[data-i]'); if (!t) return;
+  painting = true; apply(+t.dataset.i); e.preventDefault();
+});
+$('grid').addEventListener('pointermove', e => {
+  if (!painting) return;
+  const t = document.elementFromPoint(e.clientX, e.clientY);
+  if (t && t.dataset && t.dataset.i !== undefined) apply(+t.dataset.i);
+});
+addEventListener('pointerup', () => painting = false);
+addEventListener('pointercancel', () => painting = false);
+
+$('fill').onclick = () => { const c = hex2rgb($('colour').value); px = px.map(() => [...c]); paintAll(); };
+$('clear').onclick = () => { px = px.map(() => [0,0,0]); paintAll(); };
+$('erase').onclick = e => { tool = tool === 'erase' ? 'paint' : 'erase'; e.target.classList.toggle('on', tool === 'erase'); $('pick').classList.remove('on'); };
+$('pick').onclick = e => { tool = tool === 'pick' ? 'paint' : 'pick'; e.target.classList.toggle('on', tool === 'pick'); $('erase').classList.remove('on'); };
+
+function setMode(m) {
+  mode = m;
+  $('mSession').classList.toggle('on', m === 'session');
+  $('mTakeover').classList.toggle('on', m === 'takeover');
+  $('modeHelp').textContent = m === 'session'
+    ? 'Sits beside the real sessions as if it were one more. Stays until a session starts or ends.'
+    : 'Takes the whole panel. Claude takes it back the moment any session changes colour.';
+  if (layout) { const c = layout.canvas[m]; resize(c.w, c.h); }
+}
+$('mSession').onclick = () => setMode('session');
+$('mTakeover').onclick = () => setMode('takeover');
+
+async function loadLayout() {
+  try {
+    const r = await fetch(API + '/api/layout');
+    layout = await r.json();
+    if (layout.error) { $('status').textContent = 'status-light error: ' + layout.error; return; }
+    const s = layout.sessions || [];
+    $('status').textContent =
+      `${s.length} session${s.length===1?'':'s'} (${s.map(x=>x.state).join(', ') || 'none'}) · panel ${layout.panel.w}x${layout.panel.h}`
+      + (layout.override ? ` · showing a ${layout.override.mode} drawing` : '');
+    const sw = $('swatches'); sw.innerHTML = '';
+    const cols = {...(layout.colors||{}), white:0xFFFFFF, black:0x000000};
+    for (const [name, v] of Object.entries(cols)) {
+      const h = '#' + Number(v).toString(16).padStart(6,'0');
+      const d = document.createElement('div');
+      d.className = 'sw'; d.style.background = h; d.title = name;
+      d.onclick = () => { $('colour').value = h; tool='paint'; $('erase').classList.remove('on'); };
+      sw.appendChild(d);
+    }
+    const c = layout.canvas[mode];
+    if (c.w !== W || c.h !== H) resize(c.w, c.h);
+  } catch (e) {
+    $('status').textContent = 'cannot reach the PC service — is clyde-server running?';
+  }
+}
+
+$('send').onclick = async () => {
+  say('sending…');
+  try {
+    const r = await fetch(API + '/api/override', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ mode, w: W, h: H, pixels: px })
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      say(d.error + (d.expected ? ` (expected ${d.expected.w}x${d.expected.h})` : ''), 'err');
+      await loadLayout();
+      return;
+    }
+    say(`on the cube as a ${d.mode} drawing`, 'ok');
+    loadLayout();
+  } catch (e) { say('failed: ' + e, 'err'); }
+};
+
+$('revert').onclick = async () => {
+  try {
+    await fetch(API + '/api/override', { method: 'DELETE' });
+    say('cleared, Claude has the panel', 'ok');
+    loadLayout();
+  } catch (e) { say('failed: ' + e, 'err'); }
+};
+
+async function loadFrames() {
+  const box = $('frames');
+  try {
+    const d = await (await fetch(API + '/api/frames')).json();
+    box.innerHTML = '';
+    if (!d.frames.length) { box.innerHTML = '<small style="color:var(--dim)">none saved yet</small>'; return; }
+    for (const f of d.frames) {
+      const row = document.createElement('div'); row.className = 'f';
+      row.innerHTML = `<span>${f.name} <small>${f.w}x${f.h}</small></span>`;
+      const load = document.createElement('button'); load.textContent = 'Load';
+      load.onclick = async () => {
+        const fr = await (await fetch(API + '/api/frames/' + encodeURIComponent(f.name))).json();
+        if (fr.w !== W || fr.h !== H) {
+          resize(fr.w, fr.h);
+          say(`loaded at ${fr.w}x${fr.h}, which is not the current canvas — switch mode or redraw before sending`, 'err');
+        } else say(`loaded ${fr.name}`, 'ok');
+        px = fr.pixels.map(p => [...p]); paintAll();
+      };
+      const del = document.createElement('button'); del.textContent = 'Delete'; del.className = 'danger';
+      del.onclick = async () => {
+        if (!confirm(`Delete "${f.name}"?`)) return;
+        await fetch(API + '/api/frames/' + encodeURIComponent(f.name), { method: 'DELETE' });
+        loadFrames();
+      };
+      row.append(load, del); box.appendChild(row);
+    }
+  } catch (e) { box.innerHTML = '<small style="color:var(--bad)">could not list frames</small>'; }
+}
+
+$('save').onclick = async () => {
+  const name = $('fname').value.trim();
+  if (!name) { say('give it a name first', 'err'); return; }
+  const r = await fetch(API + '/api/frames', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ name, w: W, h: H, pixels: px })
+  });
+  const d = await r.json();
+  if (!r.ok) { say(d.error, 'err'); return; }
+  say(`saved ${name}`, 'ok'); $('fname').value = ''; loadFrames();
+};
+
+setMode('session');
+loadLayout().then(loadFrames);
+setInterval(loadLayout, 5000);
+</script>
