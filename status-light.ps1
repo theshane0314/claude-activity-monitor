@@ -97,7 +97,21 @@
 # stronger signal, so watch-app.ps1 darkens on that transition regardless; if
 # terminal work really is still going, its next hook repaints within seconds.
 #
-# Usage: status-light.ps1 <red|yellow|green|off|status|watchdog|prune>
+# Usage: status-light.ps1 <red|yellow|green|off|status|watchdog|prune|layout>
+#
+# MANUAL OVERRIDE. clyde-server.py serves a pixel editor and writes an override
+# file that this script honours when it paints. Two modes:
+#
+#   takeover - the drawing owns the whole panel, and is dropped the moment the
+#              session composition changes, so the next thing Claude does takes
+#              the panel back.
+#   session  - the drawing is an extra cell in the grid, exactly as if one more
+#              session were running. It survives status changes and is dropped
+#              only when the number of real sessions changes, since that is what
+#              resizes the cells underneath it.
+#
+# See Get-Override. The layout verb exists so the editor never has to reimplement
+# Get-Grid and Get-Spans: it asks for the cell size it should draw at.
 #
 # Run from a hook, the event JSON arrives on stdin and the colour is recorded
 # against that session's id. Run by hand with no stdin, the colour is forced
@@ -109,7 +123,7 @@
 
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('red', 'yellow', 'green', 'off', 'status', 'watchdog', 'prune')]
+    [ValidateSet('red', 'yellow', 'green', 'off', 'status', 'watchdog', 'prune', 'layout')]
     [string]$State
 )
 
@@ -117,7 +131,10 @@ param(
 # -- cube --
 $CubeIp     = '192.168.0.105'   # DHCP reservation for E4:B3:23:0D:47:50
 $CubePort   = 55443
-$CubeColors = @{ red = 0xFF0000; yellow = 0xFFC000; green = 0x00FF00 }
+# Chosen by eye against the cube's diffuser: pure 0x00FF00 green sitting next to
+# 0xFFC000 amber read as yellow, so green is pushed toward mint and the amber
+# toward orange to keep them apart.
+$CubeColors = @{ red = 0xFF0000; yellow = 0xFF7000; green = 0x00FF64 }
 
 # Matrix dimensions. Changing these is the only edit needed for a different
 # panel, provided the index formula in Get-PixelIndex still holds.
@@ -224,6 +241,9 @@ $TaskScanMaxAgeHours = 24
 # the primary mechanism, and it deliberately does not shorten that retention.
 # Lower it only if you are sure you will never want the output back.
 $TaskPruneDays = 7
+
+# Written by clyde-server.py, read on every paint. See Get-Override.
+$OverrideFile = Join-Path $env:TEMP 'claude-status-light.override'
 
 $ActivityFile = Join-Path $env:TEMP 'claude-status-light.activity'
 $CacheFile = Join-Path $env:TEMP 'claude-status-light.state'   # colour on the bulb
@@ -356,6 +376,70 @@ function Get-Spans {
     return , $spans
 }
 
+function Get-Override {
+    # The manual drawing, or $null. Expires it in place when it no longer
+    # applies, so nothing else has to think about staleness.
+    #
+    # The two modes expire on different things ON PURPOSE. A takeover is a
+    # deliberate "show me this instead", so ANY change to what the sessions would
+    # have shown ends it. A session drawing is meant to sit alongside real work
+    # for as long as that work runs, so it survives colour changes and ends only
+    # when the session COUNT changes, because that is what resizes every cell and
+    # would leave the drawing the wrong shape.
+    param([string[]]$States)
+
+    if (-not (Test-Path -LiteralPath $OverrideFile)) { return $null }
+
+    try { $ov = Get-Content -LiteralPath $OverrideFile -Raw -ErrorAction Stop | ConvertFrom-Json }
+    catch {
+        Write-Trace 'override: unreadable, dropping'
+        Remove-Item -LiteralPath $OverrideFile -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+
+    $states = @($States)
+    $drop = $null
+    if ($ov.mode -eq 'takeover') {
+        if ($ov.signature -ne ($states -join ',')) { $drop = 'composition changed' }
+    }
+    elseif ($ov.mode -eq 'session') {
+        if ([int]$ov.sessions -ne $states.Count) { $drop = 'session count changed' }
+    }
+    else { $drop = "unknown mode '$($ov.mode)'" }
+
+    if ($null -ne $drop) {
+        Write-Trace "override: dropped ($drop)"
+        Remove-Item -LiteralPath $OverrideFile -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    return $ov
+}
+
+function Set-Pixels {
+    # Blit a w*h block of raw RGB (base64) into the panel at $X0,$Y0. Anything
+    # falling outside the panel is clipped rather than wrapping onto the next row.
+    param([byte[]]$Buf, [string]$B64, [int]$W, [int]$H, [int]$X0, [int]$Y0)
+
+    try { $src = [Convert]::FromBase64String($B64) } catch { return $false }
+    if ($src.Length -lt ($W * $H * 3)) { return $false }
+
+    for ($yy = 0; $yy -lt $H; $yy++) {
+        for ($xx = 0; $xx -lt $W; $xx++) {
+            $x = $X0 + $xx
+            $y = $Y0 + $yy
+            if ($x -lt 0 -or $x -ge $MatrixW -or $y -lt 0 -or $y -ge $MatrixH) { continue }
+            $s = ((($yy * $W) + $xx) * 3)
+            $o = (Get-PixelIndex -X $x -Y $y) * 3
+            # Scaled like every other colour: $Brightness is the panel's output
+            # level, not a property of what is being drawn.
+            $Buf[$o] = [byte][int](($src[$s] * $Brightness) / 100)
+            $Buf[$o + 1] = [byte][int](($src[$s + 1] * $Brightness) / 100)
+            $Buf[$o + 2] = [byte][int](($src[$s + 2] * $Brightness) / 100)
+        }
+    }
+    return $true
+}
+
 function Get-Grid {
     # Columns and rows of session cells for $Count sessions.
     #
@@ -395,12 +479,12 @@ function Set-Block {
 function Get-MatrixFrame {
     # One equal cell per session on a grid, as base64 RGB. See Get-Grid for how
     # the grid is chosen and Get-Spans for how each axis is divided.
-    param([string[]]$States, [string]$Idle = 'green')
+    param([string[]]$States, [string]$Idle = 'green', $Override = $null)
 
     $states = @($States)
     $buf = New-Object 'byte[]' ($MatrixW * $MatrixH * 3)   # zeroed == all off
     $n = $states.Count
-    if ($n -eq 0) {
+    if ($n -eq 0 -and $null -eq $Override) {
         if ($IdleDark) { return [Convert]::ToBase64String($buf) }
         $c = $CubeColors[$Idle]
         if ($null -eq $c) { $c = $CubeColors['green'] }
@@ -424,6 +508,19 @@ function Get-MatrixFrame {
     }
     $avail = $MatrixH - $top
 
+    # A takeover owns the panel outright, so nothing below runs.
+    if ($null -ne $Override -and $Override.mode -eq 'takeover') {
+        if (Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) -H ([int]$Override.h) -X0 0 -Y0 $top) {
+            return [Convert]::ToBase64String($buf)
+        }
+        Write-Trace 'override: takeover pixels rejected, falling through'
+    }
+
+    # A session drawing is one more cell in the grid, placed last because the
+    # real sessions are ordered oldest-first and it is the newest arrival.
+    $extra = if ($null -ne $Override -and $Override.mode -eq 'session') { 1 } else { 0 }
+    $n += $extra
+
     # More sessions than cells cannot be drawn; the newest are dropped rather
     # than silently merged, which would be a lie about how many are running.
     if ($n -gt ($MatrixW * $avail)) { $n = $MatrixW * $avail }
@@ -446,6 +543,17 @@ function Get-MatrixFrame {
         $sx = $xs[$cx]
         $sy = $ys[$cy]
         if ($sx[1] -le 0 -or $sy[1] -le 0) { continue }
+
+        if ($extra -eq 1 -and $i -eq ($n - 1)) {
+            # The drawing's own cell. It was drawn at this exact size (the editor
+            # asks for it via the layout verb), so a mismatch means the layout
+            # moved under it and a flat colour is the honest fallback.
+            if (Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) -H ([int]$Override.h) `
+                    -X0 $sx[0] -Y0 ($top + $sy[0])) { continue }
+            Write-Trace 'override: session pixels rejected'
+            continue
+        }
+
         Set-Block -Buf $buf -X0 $sx[0] -X1 ($sx[0] + $sx[1] - 1) `
             -Y0 ($top + $sy[0]) -Y1 ($top + $sy[0] + $sy[1] - 1) `
             -Rgb (Get-Rgb $states[$i])
@@ -465,7 +573,8 @@ function Set-Cube {
         return (Send-Yeelight -Method 'set_power' -ParamsJson '["off","smooth",500]')
     }
 
-    $frame = Get-MatrixFrame -States $States -Idle $Aggregate
+    $ov = Get-Override -States $States
+    $frame = Get-MatrixFrame -States $States -Idle $Aggregate -Override $ov
 
     $client = New-Object Net.Sockets.TcpClient
     try {
@@ -865,8 +974,10 @@ function Get-CacheKey {
     if ($Want -eq 'off') { return 'cube:off' }
     $states = @()
     if ($null -ne $Slots) { $states = @($Slots | ForEach-Object { $_.State }) }
-    if ($states.Count -eq 0) { return "cube:none:$Want" }
-    return 'cube:bands:' + ($states -join ',')
+    $ov = Get-Override -States $states
+    $ovKey = if ($null -eq $ov) { '' } else { ':ov=' + $ov.mode + '/' + $ov.stamp }
+    if ($states.Count -eq 0 -and $ovKey -eq '') { return "cube:none:$Want" }
+    return 'cube:bands:' + ($states -join ',') + $ovKey
 }
 
 function Set-Light {
@@ -905,6 +1016,43 @@ function Set-Light {
         if ($null -ne $prev) { Set-Content -Path $CacheFile -Value $prev.Trim() -NoNewline }
         elseif (Test-Path $CacheFile) { Remove-Item $CacheFile -Force -ErrorAction SilentlyContinue }
     }
+}
+
+if ($State -eq 'layout') {
+    # What the editor needs to draw the right shape, so the layout maths lives
+    # here only. `cell` is the size a drawing gets in session mode, which is the
+    # cell for one MORE session than are currently running.
+    $pic = Get-Picture
+    $states = @($pic.Slots | ForEach-Object { $_.State })
+    $avail = $MatrixH - $(if ($SummaryRow) { 1 } else { 0 })
+
+    function Get-CellSize {
+        param([int]$Count)
+        if ($Count -le 0) { return @{ w = $MatrixW; h = $avail; cols = 0; rows = 0 } }
+        $g = Get-Grid -Count $Count
+        $r = [Math]::Min($g[1], $avail)
+        $xs = Get-Spans -Count $g[0] -Total $MatrixW
+        $ys = Get-Spans -Count $r -Total $avail
+        return @{ w = $xs[0][1]; h = $ys[0][1]; cols = $g[0]; rows = $r }
+    }
+
+    $ov = Get-Override -States $states
+    [pscustomobject]@{
+        panel     = @{ w = $MatrixW; h = $MatrixH; usable_h = $avail }
+        sessions  = @($pic.Slots | ForEach-Object { @{ key = $_.Key; state = $_.State } })
+        aggregate = $pic.Aggregate
+        current   = Get-CellSize -Count $states.Count
+        # The canvas the editor should offer for each mode.
+        canvas    = @{
+            takeover = @{ w = $MatrixW; h = $avail }
+            session  = Get-CellSize -Count ($states.Count + 1)
+        }
+        colors     = $CubeColors
+        brightness = $Brightness
+        override   = $(if ($null -eq $ov) { $null } else { @{ mode = $ov.mode; w = $ov.w; h = $ov.h; stamp = $ov.stamp } })
+        dark       = Get-DarkReason
+    } | ConvertTo-Json -Depth 6 -Compress
+    exit 0
 }
 
 if ($State -eq 'prune') {
