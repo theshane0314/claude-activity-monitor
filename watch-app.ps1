@@ -24,7 +24,8 @@ param(
     [int]$PollSeconds = 2,        # how fast an app close is noticed
     [int]$IdleCheckSeconds = 20,  # how often the full dark check runs
     [int]$PruneHours = 24,        # how often stale task .output files are swept
-    [int]$ServerCheckSeconds = 30 # how often clyde-server is confirmed alive
+    [int]$ServerCheckSeconds = 30, # how often clyde-server is confirmed alive
+    [int]$HeartbeatSeconds = 20    # how often the NAS is told this PC is alive
 )
 
 $ErrorActionPreference = 'Continue'
@@ -40,6 +41,16 @@ $AppPathMatch = '\\WindowsApps\\Claude'
 $ServerScript = Join-Path $PSScriptRoot 'clyde-server.py'
 $ServerPort = 8787
 $PythonW = 'C:\Users\Shane-PC\AppData\Local\Programs\Python\Python313\pythonw.exe'
+
+# clyde-nas on the NAS takes the cube when this PC stops driving it. It decides
+# that from the ABSENCE of these heartbeats.
+#
+# Pushed rather than polled, deliberately. Polling from the NAS would need an
+# inbound firewall rule here, and would only prove the host answers, not that the
+# status light is alive and painting. This is a positive assertion from the
+# process that actually does the painting, and it travels outbound, which needs
+# no firewall change.
+$HeartbeatUrl = 'http://192.168.0.3:8788/heartbeat'
 $TraceFile = Join-Path $env:TEMP 'claude-status-light-trace.log'
 
 function Write-Trace {
@@ -86,6 +97,18 @@ function Start-Server {
     catch { Write-Trace ('could not start clyde-server: ' + $_.Exception.Message) }
 }
 
+function Send-Heartbeat {
+    # Never let this hold up the loop or throw: the NAS being unreachable is not
+    # this machine's problem, and the correct consequence (the NAS eventually
+    # taking the cube) is exactly what silence already achieves.
+    try {
+        Invoke-RestMethod -Uri $HeartbeatUrl -Method Post -TimeoutSec 3 `
+            -ContentType 'application/json' -Body '{}' -ErrorAction Stop | Out-Null
+        return $true
+    }
+    catch { return $false }
+}
+
 function Invoke-StatusLight {
     param([string]$Verb)
     # Run detached-ish and never let a failure kill the loop: this process has to
@@ -113,6 +136,8 @@ try {
     # restarted by the supervisor and should not sweep on every restart.
     $lastPrune = Get-Date
     $lastServerCheck = (Get-Date).AddYears(-1)   # check immediately on startup
+    $lastHeartbeat = (Get-Date).AddYears(-1)     # and claim the cube immediately
+    $heartbeatWasUp = $true
 
     while ($true) {
         Start-Sleep -Seconds $PollSeconds
@@ -140,6 +165,17 @@ try {
         if (((Get-Date) - $lastIdleCheck).TotalSeconds -ge $IdleCheckSeconds) {
             $lastIdleCheck = Get-Date
             Invoke-StatusLight -Verb 'watchdog'
+        }
+
+        # Tell the NAS this PC still owns the cube. Only logged on a CHANGE, or
+        # a NAS that is simply switched off would fill the trace forever.
+        if (((Get-Date) - $lastHeartbeat).TotalSeconds -ge $HeartbeatSeconds) {
+            $lastHeartbeat = Get-Date
+            $up = Send-Heartbeat
+            if ($up -ne $heartbeatWasUp) {
+                Write-Trace $(if ($up) { 'NAS heartbeat resumed' } else { 'NAS heartbeat failing (it may take the cube)' })
+                $heartbeatWasUp = $up
+            }
         }
 
         # Keep the editor's server alive. Cheap: a loopback connect, and a
