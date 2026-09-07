@@ -290,7 +290,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(layout, 502)
 
         states = [s["state"] for s in layout.get("sessions", [])]
-        want = layout["canvas"]["takeover" if mode == "takeover" else "session"]
+
+        share = total = None
+        if mode == "takeover":
+            want = layout["canvas"]["takeover"]
+        else:
+            # How much of the panel the drawing claims, as share/total parts.
+            # Defaults to one part out of (sessions + 1), which is the old
+            # "counts as one more session" behaviour.
+            share = int(body.get("share", 1))
+            total = int(body.get("total", len(states) + 1))
+            want = next((s for s in layout.get("splits", [])
+                         if s["share"] == share and s["total"] == total), None)
+            if want is None:
+                return self.send_json({
+                    "error": f"no such split {share}/{total}",
+                    "available": [f'{s["share"]}/{s["total"]}' for s in layout.get("splits", [])],
+                }, 400)
 
         try:
             w, h = int(body["w"]), int(body["h"])
@@ -317,6 +333,7 @@ class Handler(BaseHTTPRequestHandler):
             "stamp": str(int(time.time() * 1000)),
             "sessions": len(states),
             "signature": ",".join(states),
+            "share": share, "total": total,
         }
         tmp = OVERRIDE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -325,6 +342,7 @@ class Handler(BaseHTTPRequestHandler):
 
         ok, out, err = run_status_light("watchdog")
         return self.send_json({"ok": True, "mode": mode, "w": w, "h": h,
+                               "share": share, "total": total,
                                "repainted": ok, "detail": (err or "").strip()[:200]})
 
 

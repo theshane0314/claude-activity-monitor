@@ -105,10 +105,13 @@
 #   takeover - the drawing owns the whole panel, and is dropped the moment the
 #              session composition changes, so the next thing Claude does takes
 #              the panel back.
-#   session  - the drawing is an extra cell in the grid, exactly as if one more
-#              session were running. It survives status changes and is dropped
+#   session  - the drawing takes a SHARE of the panel and every real session
+#              shares what is left. The share is share/total parts, so 1/2 gives
+#              the drawing half, 2/3 gives it the right two thirds with all the
+#              sessions packed into the left third, and 1/(sessions+1) reproduces
+#              "just one more session". It survives status changes and is dropped
 #              only when the number of real sessions changes, since that is what
-#              resizes the cells underneath it.
+#              resizes the sessions' own region underneath it.
 #
 # See Get-Override. The layout verb exists so the editor never has to reimplement
 # Get-Grid and Get-Spans: it asks for the cell size it should draw at.
@@ -441,18 +444,30 @@ function Set-Pixels {
 }
 
 function Get-Grid {
-    # Columns and rows of session cells for $Count sessions.
+    # Columns and rows of session cells for $Count sessions, within a region
+    # $Width wide (the whole panel unless a drawing has claimed part of it).
     #
-    # One row up to three: a third of the panel at full height reads better than
-    # a sixth of it half-height, and there is nothing to gain from the split.
-    # Two rows from four, which makes four sessions quadrants.
+    # ON THE FULL PANEL: one row up to three, because a third of a 20-wide panel
+    # at full height reads better than a sixth of it half-height. Two rows from
+    # four, which makes four sessions quadrants.
     #
-    # Rows are only added beyond two when the columns genuinely run out, so the
-    # cells stay as tall as possible for as long as possible.
-    param([int]$Count)
+    # IN A NARROW REGION the opposite is true, and the same rule would be wrong.
+    # Two sessions sharing a 6-wide strip side by side are 3x5 slivers; stacked
+    # they are 6x2 blocks, which match the landscape shape of the panel and read
+    # far better. So a narrow region stacks first and only adds columns when it
+    # runs out of rows.
+    param([int]$Count, [int]$Width = $MatrixW)
+
+    if ($Count -le 0) { return @(1, 1) }
+
+    if ($Width -lt ($MatrixW / 2)) {
+        $rows = [Math]::Min($Count, $MatrixH)
+        $cols = [Math]::Ceiling($Count / $rows)
+        return @($cols, $rows)
+    }
 
     $rows = if ($Count -le 3) { 1 } else { 2 }
-    while ($rows -lt $MatrixH -and [Math]::Ceiling($Count / $rows) -gt $MatrixW) { $rows++ }
+    while ($rows -lt $MatrixH -and [Math]::Ceiling($Count / $rows) -gt $Width) { $rows++ }
     $cols = [Math]::Ceiling($Count / $rows)
     if ($cols -lt 1) { $cols = 1 }
     return @($cols, $rows)
@@ -516,23 +531,51 @@ function Get-MatrixFrame {
         Write-Trace 'override: takeover pixels rejected, falling through'
     }
 
-    # A session drawing is one more cell in the grid, placed last because the
-    # real sessions are ordered oldest-first and it is the newest arrival.
-    $extra = if ($null -ne $Override -and $Override.mode -eq 'session') { 1 } else { 0 }
-    $n += $extra
+    # A session drawing takes a SHARE of the width, and the real sessions lay
+    # themselves out inside whatever is left. The drawing is on the RIGHT because
+    # sessions are ordered oldest-first from the left, so the panel keeps reading
+    # left to right by age with the manual block on the end.
+    $regionX0 = 0
+    $regionW = $MatrixW
+    if ($null -ne $Override -and $Override.mode -eq 'session') {
+        $total = [int]$Override.total
+        $share = [int]$Override.share
+        if ($total -lt 2) { $total = 2 }
+        if ($share -lt 1) { $share = 1 }
+        if ($share -ge $total) { $share = $total - 1 }
+
+        $parts = Get-Spans -Count $total -Total $MatrixW
+        $sesParts = $total - $share
+        $regionX0 = $parts[0][0]
+        $regionW = ($parts[$sesParts - 1][0] + $parts[$sesParts - 1][1]) - $regionX0
+
+        $drawX0 = $parts[$sesParts][0]
+        $drawX1 = $parts[$total - 1][0] + $parts[$total - 1][1] - 1
+
+        if (-not (Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) `
+                    -H ([int]$Override.h) -X0 $drawX0 -Y0 $top)) {
+            Write-Trace 'override: session pixels rejected'
+        }
+
+        # Nothing running: the drawing is the whole point, so stop here rather
+        # than painting an empty region beside it.
+        if ($n -eq 0) { return [Convert]::ToBase64String($buf) }
+    }
 
     # More sessions than cells cannot be drawn; the newest are dropped rather
     # than silently merged, which would be a lie about how many are running.
-    if ($n -gt ($MatrixW * $avail)) { $n = $MatrixW * $avail }
+    if ($n -gt ($regionW * $avail)) { $n = $regionW * $avail }
 
-    $grid = Get-Grid -Count $n
+    $grid = Get-Grid -Count $n -Width $regionW
     $cols = $grid[0]
     $gridRows = $grid[1]
     if ($gridRows -gt $avail) { $gridRows = $avail }
 
     # Both axes divided by the same rule, so cells are equal in both directions
     # and the leftover lands in the gaps.
-    $xs = Get-Spans -Count $cols -Total $MatrixW
+    # Divided within the sessions' region, which is the whole panel unless a
+    # drawing has claimed part of it.
+    $xs = Get-Spans -Count $cols -Total $regionW
     $ys = Get-Spans -Count $gridRows -Total $avail
 
     # Reading order: oldest session top-left, filling right then down.
@@ -544,17 +587,7 @@ function Get-MatrixFrame {
         $sy = $ys[$cy]
         if ($sx[1] -le 0 -or $sy[1] -le 0) { continue }
 
-        if ($extra -eq 1 -and $i -eq ($n - 1)) {
-            # The drawing's own cell. It was drawn at this exact size (the editor
-            # asks for it via the layout verb), so a mismatch means the layout
-            # moved under it and a flat colour is the honest fallback.
-            if (Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) -H ([int]$Override.h) `
-                    -X0 $sx[0] -Y0 ($top + $sy[0])) { continue }
-            Write-Trace 'override: session pixels rejected'
-            continue
-        }
-
-        Set-Block -Buf $buf -X0 $sx[0] -X1 ($sx[0] + $sx[1] - 1) `
+        Set-Block -Buf $buf -X0 ($regionX0 + $sx[0]) -X1 ($regionX0 + $sx[0] + $sx[1] - 1) `
             -Y0 ($top + $sy[0]) -Y1 ($top + $sy[0] + $sy[1] - 1) `
             -Rgb (Get-Rgb $states[$i])
     }
@@ -665,14 +698,23 @@ function Show-Status {
             "            clears when the session composition changes"
             return
         }
-        if ($null -ne $ovs -and $ovs.mode -eq 'session') { $n++ }
 
-        $grid = Get-Grid -Count $n
+        $regionW = $MatrixW
+        if ($null -ne $ovs -and $ovs.mode -eq 'session') {
+            $ps = Get-Spans -Count ([int]$ovs.total) -Total $MatrixW
+            $sesParts = [int]$ovs.total - [int]$ovs.share
+            $regionW = ($ps[$sesParts - 1][0] + $ps[$sesParts - 1][1]) - $ps[0][0]
+            "display   : drawing takes $($ovs.share)/$($ovs.total) on the right ($($ovs.w)x$($ovs.h))"
+            "            $n session(s) share the left ${regionW} of $MatrixW columns"
+        }
+
+        $grid = Get-Grid -Count $n -Width $regionW
         $cols = $grid[0]; $gridRows = [Math]::Min($grid[1], $avail)
-        $xs = Get-Spans -Count $cols -Total $MatrixW
+        $xs = Get-Spans -Count $cols -Total $regionW
         $ys = Get-Spans -Count $gridRows -Total $avail
         $cells = $cols * $gridRows
-        "display   : $n session(s) on a ${cols}x${gridRows} grid, cells $($xs[0][1])x$($ys[0][1]), oldest top-left"
+        $where = if ($regionW -eq $MatrixW) { 'display   : ' } else { '            ' }
+        "$where$n session(s) on a ${cols}x${gridRows} grid, cells $($xs[0][1])x$($ys[0][1]), oldest top-left"
         if ($cells -gt $n) { "            $($cells - $n) spare cell(s) left dark" }
         for ($r = 0; $r -lt $gridRows; $r++) {
             $row = @()
@@ -1055,7 +1097,20 @@ if ($State -eq 'layout') {
         sessions  = @($pic.Slots | ForEach-Object { @{ key = $_.Key; state = $_.State } })
         aggregate = $pic.Aggregate
         current   = Get-CellSize -Count $states.Count
-        # The canvas the editor should offer for each mode.
+        # Every split the editor can offer, with the canvas each would give.
+        # share/total parts go to the drawing, the rest to the sessions.
+        splits    = @(
+            foreach ($t in 2..4) {
+                foreach ($sh in 1..($t - 1)) {
+                    $ps = Get-Spans -Count $t -Total $MatrixW
+                    $x0 = $ps[$t - $sh][0]
+                    $x1 = $ps[$t - 1][0] + $ps[$t - 1][1] - 1
+                    @{ share = $sh; total = $t; w = ($x1 - $x0 + 1); h = $avail
+                        label = "$sh/$t of the panel"
+                    }
+                }
+            }
+        )
         canvas    = @{
             takeover = @{ w = $MatrixW; h = $avail }
             session  = Get-CellSize -Count ($states.Count + 1)

@@ -6,18 +6,20 @@
   :root {
     --bg: #14161a; --panel: #1c1f26; --line: #2c313b; --ink: #e6e9ef;
     --dim: #98a0ae; --accent: #FF7000; --ok: #00FF64; --bad: #ff4d4d;
+    --gw: 20; --gh: 5;
+    --gmax: 30vh;      /* the grid never eats more than this much height */
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
-    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    padding: 14px; -webkit-text-size-adjust: 100%;
+    font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    padding: 10px; -webkit-text-size-adjust: 100%;
   }
   h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -.01em; font-weight: 650; }
   .sub { color: var(--dim); font-size: 11px; margin-bottom: 16px; }
   .card {
     background: var(--panel); border: 1px solid var(--line);
-    border-radius: 10px; padding: 12px; margin-bottom: 12px;
+    border-radius: 10px; padding: 10px; margin-bottom: 9px;
   }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .row + .row { margin-top: 8px; }
@@ -37,13 +39,18 @@
 
   /* The grid is the point, so it gets the room. aspect-ratio keeps the cube's
      proportions whatever the canvas size turns out to be. */
+  /* The grid keeps the panel's proportions and is capped by the VIEWPORT, not
+     by the column count. Without the height cap a 6-wide canvas produced
+     enormous cells and pushed everything else off screen. */
   #grid {
-    display: grid; gap: 2px; width: 100%; margin: 0 auto;
-    background: #0c0e11; padding: 6px; border-radius: 8px;
+    display: grid; gap: 2px; margin: 0 auto;
+    aspect-ratio: var(--gw) / var(--gh);
+    width: min(100%, calc(var(--gmax) * var(--gw) / var(--gh)));
+    background: #0c0e11; padding: 5px; border-radius: 8px;
     touch-action: none; user-select: none;
   }
   #grid div {
-    aspect-ratio: 1; border-radius: 3px; background: #000;
+    border-radius: 2px; background: #000;
     box-shadow: inset 0 0 0 1px #ffffff08;
   }
   .swatches { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -59,7 +66,7 @@
     font-size: 11px; padding: 3px 8px; border-radius: 99px;
     background: #262b34; color: var(--dim); border: 1px solid var(--line);
   }
-  .frames { display: flex; flex-direction: column; gap: 5px; max-height: 190px; overflow: auto; }
+  .frames { display: flex; flex-direction: column; gap: 5px; max-height: 22vh; overflow: auto; }
   .frames .f { display: flex; gap: 6px; align-items: center; }
   .frames .f span { flex: 1; }
   .frames .f small { color: var(--dim); font-size: 11px; }
@@ -77,8 +84,9 @@
 <div class="card">
   <div class="row">
     <label>Mode</label>
-    <button id="mSession" class="on">As a session</button>
+    <button id="mSession" class="on">Share with sessions</button>
     <button id="mTakeover">Whole panel</button>
+    <select id="split" title="How much of the panel the drawing takes"></select>
     <span class="pill" id="canvasSize">no canvas yet</span>
   </div>
   <div class="row" id="modeHelp" style="color:var(--dim);font-size:11px"></div>
@@ -126,6 +134,9 @@ function say(t, cls='') { const m = $('msg'); m.textContent = t; m.className = '
 function buildGrid() {
   const g = $('grid');
   g.style.gridTemplateColumns = `repeat(${W}, 1fr)`;
+  // Drives the aspect-ratio and the viewport height cap in CSS.
+  g.style.setProperty('--gw', W);
+  g.style.setProperty('--gh', H);
   g.innerHTML = '';
   for (let i = 0; i < W * H; i++) {
     const d = document.createElement('div');
@@ -183,17 +194,27 @@ $('clear').onclick = () => { px = px.map(() => [0,0,0]); paintAll(); };
 $('erase').onclick = e => { tool = tool === 'erase' ? 'paint' : 'erase'; e.target.classList.toggle('on', tool === 'erase'); $('pick').classList.remove('on'); };
 $('pick').onclick = e => { tool = tool === 'pick' ? 'paint' : 'pick'; e.target.classList.toggle('on', tool === 'pick'); $('erase').classList.remove('on'); };
 
+function currentSplit() {
+  if (!layout || !layout.splits) return null;
+  const v = $('split').value;
+  return layout.splits.find(s => `${s.share}/${s.total}` === v) || layout.splits[0];
+}
+
 function setMode(m) {
   mode = m;
   $('mSession').classList.toggle('on', m === 'session');
   $('mTakeover').classList.toggle('on', m === 'takeover');
+  $('split').style.display = m === 'session' ? '' : 'none';
   $('modeHelp').textContent = m === 'session'
-    ? 'Sits beside the real sessions as if it were one more. Stays until a session starts or ends.'
+    ? 'Your drawing takes the right part of the panel; every live session shares what is left. Stays until a session starts or ends.'
     : 'Takes the whole panel. Claude takes it back the moment any session changes colour.';
-  if (layout) { const c = layout.canvas[m]; resize(c.w, c.h); }
+  if (!layout) return;
+  if (m === 'takeover') { const c = layout.canvas.takeover; resize(c.w, c.h); }
+  else { const s = currentSplit(); if (s) resize(s.w, s.h); }
 }
 $('mSession').onclick = () => setMode('session');
 $('mTakeover').onclick = () => setMode('takeover');
+$('split').onchange = () => setMode('session');
 
 async function loadLayout() {
   try {
@@ -213,8 +234,21 @@ async function loadLayout() {
       d.onclick = () => { $('colour').value = h; tool='paint'; $('erase').classList.remove('on'); };
       sw.appendChild(d);
     }
-    const c = layout.canvas[mode];
-    if (c.w !== W || c.h !== H) resize(c.w, c.h);
+    const sel = $('split');
+    if (sel.options.length !== (layout.splits || []).length) {
+      const keep = sel.value;
+      sel.innerHTML = '';
+      for (const s of layout.splits || []) {
+        const o = document.createElement('option');
+        o.value = `${s.share}/${s.total}`;
+        o.textContent = `${s.label} (${s.w}x${s.h})`;
+        sel.appendChild(o);
+      }
+      if (keep) sel.value = keep;
+      if (!sel.value && sel.options.length) sel.selectedIndex = 0;
+    }
+    const c = mode === 'takeover' ? layout.canvas.takeover : currentSplit();
+    if (c && (c.w !== W || c.h !== H)) resize(c.w, c.h);
   } catch (e) {
     $('status').textContent = 'cannot reach the PC service — is clyde-server running?';
   }
@@ -225,7 +259,9 @@ $('send').onclick = async () => {
   try {
     const r = await fetch(API + '/api/override', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ mode, w: W, h: H, pixels: px })
+      body: JSON.stringify(Object.assign({ mode, w: W, h: H, pixels: px },
+        mode === 'session' && currentSplit()
+          ? { share: currentSplit().share, total: currentSplit().total } : {}))
     });
     const d = await r.json();
     if (!r.ok) {
