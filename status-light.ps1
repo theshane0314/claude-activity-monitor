@@ -1099,17 +1099,33 @@ if ($State -eq 'layout') {
         current   = Get-CellSize -Count $states.Count
         # Every split the editor can offer, with the canvas each would give.
         # share/total parts go to the drawing, the rest to the sessions.
+        #
+        # ONLY REDUCED FRACTIONS, and ordered by how much of the panel they take.
+        # Generating every share/total pair produced 2/4 alongside 1/2, which is
+        # the same split written twice, and left the list in denominator order
+        # rather than size order.
         splits    = @(
-            foreach ($t in 2..4) {
+            $seen = @{}
+            $out = foreach ($t in 2..4) {
                 foreach ($sh in 1..($t - 1)) {
+                    $a = $sh; $b = $t
+                    while ($b -ne 0) { $tmp = $b; $b = $a % $b; $a = $tmp }
+                    if ($a -ne 1) { continue }          # not in lowest terms
+                    $key = "$sh/$t"
+                    if ($seen.ContainsKey($key)) { continue }
+                    $seen[$key] = $true
+
                     $ps = Get-Spans -Count $t -Total $MatrixW
                     $x0 = $ps[$t - $sh][0]
                     $x1 = $ps[$t - 1][0] + $ps[$t - 1][1] - 1
-                    @{ share = $sh; total = $t; w = ($x1 - $x0 + 1); h = $avail
+                    [pscustomobject]@{
+                        share = $sh; total = $t; w = ($x1 - $x0 + 1); h = $avail
                         label = "$sh/$t of the panel"
+                        frac  = ($sh / $t)
                     }
                 }
             }
+            $out | Sort-Object frac
         )
         canvas    = @{
             takeover = @{ w = $MatrixW; h = $avail }
