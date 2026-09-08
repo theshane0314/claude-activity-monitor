@@ -6,8 +6,7 @@
   :root {
     --bg: #14161a; --panel: #1c1f26; --line: #2c313b; --ink: #e6e9ef;
     --dim: #98a0ae; --accent: #FF7000; --ok: #00FF64; --bad: #ff4d4d;
-    --gw: 20; --gh: 5;
-    --gmax: 30vh;      /* the grid never eats more than this much height */
+    --thumb: #3a4150;
   }
   * { box-sizing: border-box; }
   body {
@@ -24,7 +23,7 @@
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .row + .row { margin-top: 8px; }
   label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
-  button, select, input[type=text] {
+  button, select, input[type=text], input[type=number] {
     background: #262b34; color: var(--ink); border: 1px solid var(--line);
     border-radius: 7px; padding: 7px 11px; font: inherit; cursor: pointer;
   }
@@ -32,20 +31,30 @@
   button.on { background: var(--accent); border-color: var(--accent); color: #1a1206; font-weight: 600; }
   button.danger:hover { border-color: var(--bad); color: var(--bad); }
   input[type=text] { cursor: text; min-width: 130px; }
+  input[type=number] { cursor: text; width: 74px; padding-right: 4px; }
   input[type=color] {
     width: 44px; height: 34px; padding: 2px; background: #262b34;
     border: 1px solid var(--line); border-radius: 7px; cursor: pointer;
   }
+  input[type=range] {
+    accent-color: var(--accent); background: transparent;
+    flex: 1 1 160px; min-width: 130px; cursor: pointer;
+  }
+  button:disabled, input:disabled { opacity: .45; cursor: default; }
 
-  /* The grid is the point, so it gets the room. aspect-ratio keeps the cube's
-     proportions whatever the canvas size turns out to be. */
-  /* The grid keeps the panel's proportions and is capped by the VIEWPORT, not
-     by the column count. Without the height cap a 6-wide canvas produced
-     enormous cells and pushed everything else off screen. */
+  /* The grid is the point, so it gets the room. Cell size is worked out in JS
+     from the viewport height and the width available, so a canvas wider than
+     the panel keeps usable cells and scrolls sideways inside its own box
+     instead of shrinking to nothing or widening the page. */
+  #gridwrap {
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: thin; scrollbar-color: var(--thumb) transparent;
+  }
+  #gridwrap::-webkit-scrollbar { height: 7px; }
+  #gridwrap::-webkit-scrollbar-track { background: transparent; }
+  #gridwrap::-webkit-scrollbar-thumb { background: var(--thumb); border-radius: 4px; }
   #grid {
-    display: grid; gap: 2px; margin: 0 auto;
-    aspect-ratio: var(--gw) / var(--gh);
-    width: min(100%, calc(var(--gmax) * var(--gw) / var(--gh)));
+    display: grid; gap: 2px; margin: 0 auto; width: max-content;
     background: #0c0e11; padding: 5px; border-radius: 8px;
     touch-action: none; user-select: none;
   }
@@ -66,20 +75,73 @@
     font-size: 11px; padding: 3px 8px; border-radius: 99px;
     background: #262b34; color: var(--dim); border: 1px solid var(--line);
   }
+  .pill.live { color: var(--accent); border-color: #4a3a24; }
   .frames { display: flex; flex-direction: column; gap: 5px; max-height: 22vh; overflow: auto; }
   .frames .f { display: flex; gap: 6px; align-items: center; }
   .frames .f span { flex: 1; }
   .frames .f small { color: var(--dim); font-size: 11px; }
   /* One scroll region only: the frame list scrolls internally, the page does not
      grow a second bar for it. */
-  .frames { scrollbar-width: thin; scrollbar-color: #3a4150 transparent; }
+  .frames { scrollbar-width: thin; scrollbar-color: var(--thumb) transparent; }
   .frames::-webkit-scrollbar { width: 7px; }
   .frames::-webkit-scrollbar-track { background: transparent; }
-  .frames::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 4px; }
+  .frames::-webkit-scrollbar-thumb { background: var(--thumb); border-radius: 4px; }
+
+  /* Preview: the panel-sized window on the left of the mind's eye, and under it
+     the whole canvas with the window drawn on top of it. Both are canvases, so
+     they cost nothing to animate. */
+  .pv { display: block; margin: 0 auto; border-radius: 8px; background: #0c0e11; }
+  #pvStrip { margin-top: 8px; opacity: .95; }
+  .pvnote { color: var(--dim); font-size: 11px; margin-top: 6px; text-align: center; }
+  /* Why the speed ceiling is where it is. Without this the cap reads as an
+     arbitrary number somebody should raise, and somebody would. */
+  .hint { color: var(--dim); font-size: 11px; line-height: 1.45; }
+  /* A value and its unit wrap as one thing, or a narrow panel drops "blank cols"
+     onto a line of its own where it reads as a heading for nothing. */
+  .pair { display: inline-flex; gap: 8px; align-items: center; }
+  .hint b { color: var(--ink); font-weight: 600; }
+
+  /* What is on the panel. Deliberately NOT a scroll box: the page already has
+     two internal scrollers and a third would be one too many. There are only
+     ever a handful of sessions, so the list is allowed to be as tall as it is. */
+  .sess { display: flex; flex-direction: column; gap: 6px; margin-top: 9px; }
+  .sess .s {
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    background: #20242c; border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 9px;
+  }
+  .sess .s.stuck { border-color: #4a3a24; }
+  .sess .id {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 12px; letter-spacing: .01em;
+  }
+  .sess .why { color: var(--dim); font-size: 11px; flex: 1 1 210px; min-width: 0; }
+  .sess .s button { padding: 4px 10px; font-size: 12px; }
+  .dot { width: 9px; height: 9px; border-radius: 99px; flex: none; box-shadow: inset 0 0 0 1px #00000055; }
+  .tag {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+    padding: 2px 7px; border-radius: 99px;
+    background: #262b34; border: 1px solid var(--line); color: var(--dim);
+  }
+  .tag.stuck { color: var(--accent); border-color: #4a3a24; }
+  .tag.live { color: var(--ok); border-color: #1e4230; }
+  .none { color: var(--dim); font-size: 11px; }
 </style>
 
 <h1>ClydeCube</h1>
 <div class="sub" id="status">connecting…</div>
+
+<div class="card">
+  <div class="row">
+    <label>On the panel</label>
+    <span class="pill" id="sessCount">checking…</span>
+    <button id="sessRefresh" title="Ask the PC what is pinning a block right now">Refresh</button>
+    <button id="sessClear" class="danger">Clear stuck sessions</button>
+  </div>
+  <div class="sess" id="sessList"></div>
+  <div class="hint" id="sessSafe" style="margin-top:9px"></div>
+  <div class="msg" id="sessMsg"></div>
+</div>
 
 <div class="card">
   <div class="row">
@@ -93,7 +155,7 @@
 </div>
 
 <div class="card">
-  <div id="grid"></div>
+  <div id="gridwrap"><div id="grid"></div></div>
   <div class="row" style="margin-top:10px">
     <input type="color" id="colour" value="#ff7000">
     <div class="swatches" id="swatches"></div>
@@ -116,6 +178,48 @@
 
 <div class="card">
   <div class="row">
+    <label>Canvas width</label>
+    <input type="range" id="cw" min="20" max="120" step="1" value="20"
+           title="Draw wider than the panel and the panel becomes a window onto it">
+    <span class="pill" id="cwVal">20 cols</span>
+    <button id="cwReset" title="Back to exactly the panel width">Fit panel</button>
+  </div>
+  <div class="row">
+    <label>Ticker</label>
+    <button id="scrollOn">Scroll</button>
+    <label>Speed</label>
+    <span class="pair">
+      <input type="number" id="spd" min="0.05" max="1" step="0.05" value="0.7" title="Updates per second">
+      <span class="pill">updates/sec</span>
+    </span>
+    <label>Step</label>
+    <span class="pair">
+      <input type="number" id="stp" min="1" max="8" step="1" value="4" title="Columns moved on each update; 4 is one character">
+      <span class="pill">cols/update</span>
+    </span>
+  </div>
+  <div class="row">
+    <div class="hint" id="capNote"></div>
+  </div>
+  <div class="row">
+    <label>Direction</label>
+    <button id="dirL" class="on">Left</button>
+    <button id="dirR">Right</button>
+    <label>Gap</label>
+    <span class="pair">
+      <input type="number" id="gap" min="0" max="64" step="1" value="8" title="Blank columns between repeats">
+      <span class="pill">blank cols</span>
+    </span>
+  </div>
+  <div class="row"><label>Preview</label><span class="pill" id="pvInfo"></span></div>
+  <div class="row"><span class="hint" id="pvDetail"></span></div>
+  <canvas id="pvWin" class="pv"></canvas>
+  <canvas id="pvStrip" class="pv"></canvas>
+  <div class="pvnote" id="pvNote"></div>
+</div>
+
+<div class="card">
+  <div class="row">
     <input type="text" id="fname" placeholder="frame name">
     <button id="save">Save frame</button>
   </div>
@@ -130,38 +234,61 @@ const API = location.origin + location.pathname.replace(/\/[^/]*$/, '');
 let W = 20, H = 5, mode = 'session', px = [], tool = 'paint';
 let layout = null, painting = false;
 
+// regionW is the slice of the physical panel the drawing lands in. W is the
+// canvas the user draws on and it may now be wider: the panel then becomes a
+// window that walks across it.
+let regionW = 20, maxW = 120;
+let scrollOn = false, scrollDir = 'left';
+
 const $ = id => document.getElementById(id);
 const hex2rgb = h => [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
 const rgb2hex = c => '#' + c.map(v => v.toString(16).padStart(2,'0')).join('');
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
 function say(t, cls='') { const m = $('msg'); m.textContent = t; m.className = 'msg ' + cls; }
 
+// ---- grid ----------------------------------------------------------------
+
+// Cell size comes from whichever runs out first, the viewport height or the
+// width on offer, with a floor so a wide canvas stays drawable with a finger.
+function sizeGrid() {
+  const wrap = $('gridwrap');
+  const avail = Math.max(120, wrap.clientWidth) - 12;
+  const byH = (window.innerHeight * 0.30) / H;
+  const byW = (avail - 2 * (W - 1)) / W;
+  const cell = clamp(Math.min(byH, byW), 11, 56);
+  const g = $('grid');
+  g.style.gridTemplateColumns = `repeat(${W}, ${cell.toFixed(2)}px)`;
+  g.style.gridAutoRows = cell.toFixed(2) + 'px';
+}
+
 function buildGrid() {
   const g = $('grid');
-  g.style.gridTemplateColumns = `repeat(${W}, 1fr)`;
-  // Drives the aspect-ratio and the viewport height cap in CSS.
-  g.style.setProperty('--gw', W);
-  g.style.setProperty('--gh', H);
   g.innerHTML = '';
   for (let i = 0; i < W * H; i++) {
     const d = document.createElement('div');
     d.dataset.i = i;
     g.appendChild(d);
   }
+  sizeGrid();
   paintAll();
-  $('canvasSize').textContent = `${W} x ${H}`;
+  $('canvasSize').textContent = W > regionW
+    ? `${W} x ${H}, window ${regionW}` : `${W} x ${H}`;
+  syncScrollUI();
 }
 
 function paintAll() {
   const kids = $('grid').children;
   for (let i = 0; i < px.length; i++) kids[i].style.background = rgb2hex(px[i]);
+  pvDirty = true;
 }
 
 function resize(w, h) {
   const old = px, ow = W, oh = H;
   W = w; H = h;
   px = Array.from({length: W*H}, () => [0,0,0]);
-  // Keep whatever still fits, so switching mode does not silently bin the drawing.
+  // Keep whatever still fits, so switching mode or widening does not silently
+  // bin the drawing.
   if (old.length) {
     for (let y = 0; y < Math.min(h, oh); y++)
       for (let x = 0; x < Math.min(w, ow); x++)
@@ -179,6 +306,7 @@ function apply(i) {
   }
   px[i] = tool === 'erase' ? [0,0,0] : hex2rgb($('colour').value);
   $('grid').children[i].style.background = rgb2hex(px[i]);
+  pvDirty = true;
 }
 
 // Pointer events so it works with a mouse and with a finger on the HA app.
@@ -193,16 +321,344 @@ $('grid').addEventListener('pointermove', e => {
 });
 addEventListener('pointerup', () => painting = false);
 addEventListener('pointercancel', () => painting = false);
+addEventListener('resize', () => { sizeGrid(); pvDirty = true; sizePreview(); });
 
 $('fill').onclick = () => { const c = hex2rgb($('colour').value); px = px.map(() => [...c]); paintAll(); };
 $('clear').onclick = () => { px = px.map(() => [0,0,0]); paintAll(); };
 $('erase').onclick = e => { tool = tool === 'erase' ? 'paint' : 'erase'; e.target.classList.toggle('on', tool === 'erase'); $('pick').classList.remove('on'); };
 $('pick').onclick = e => { tool = tool === 'pick' ? 'paint' : 'pick'; e.target.classList.toggle('on', tool === 'pick'); $('erase').classList.remove('on'); };
 
+// ---- scroll settings -----------------------------------------------------
+
+// SPEED IS NOW UPDATES PER SECOND, NOT COLUMNS PER SECOND, and its ceiling is
+// hardware rather than taste. Measured 2026-09-08: the cube refuses a connection
+// after about 25 to 30 commands and refills at roughly 68 a minute, so anything
+// past about one update a second stops rendering and the panel freezes on its
+// last frame. update_leds never replies, so it freezes SILENTLY. 0.7 leaves
+// headroom for the ordinary status paints, which still need commands of their
+// own. There is no on-device animation mode to hand the work to: 15 mode strings
+// were probed and only "direct" exists.
+const HARD_SPEED_MAX = 1.0;
+const LIM = {
+  speedMin: 0.05, speedMax: HARD_SPEED_MAX, speedDefault: 0.7,
+  stepMin: 1, stepMax: 8, stepDefault: 4,
+  gapMin: 0, gapMax: 64, gapDefault: 8,
+};
+// True when the server still advertises the pre-measurement limits, which means
+// it is an older build and will refuse the `step` key outright.
+let staleLimits = false;
+
+const speedVal = () => clamp(parseFloat($('spd').value) || LIM.speedDefault, LIM.speedMin, LIM.speedMax);
+const stepVal  = () => clamp(parseInt($('stp').value, 10) || LIM.stepDefault, LIM.stepMin, LIM.stepMax);
+const gapVal   = () => clamp(parseInt($('gap').value, 10) || 0, LIM.gapMin, LIM.gapMax);
+
+function scrollPayload() {
+  if (!scrollOn) return null;
+  return { speed: speedVal(), step: stepVal(), dir: scrollDir, gap: gapVal(), loop: true };
+}
+
+function applyScroll(s) {
+  if (!s) { scrollOn = false; syncScrollUI(); return; }
+  scrollOn = true;
+  scrollDir = s.dir === 'right' ? 'right' : 'left';
+  const sp = parseFloat(s.speed);
+  $('spd').value = round2(clamp(Number.isFinite(sp) ? sp : LIM.speedDefault, LIM.speedMin, LIM.speedMax));
+  const st = parseInt(s.step, 10);
+  $('stp').value = clamp(Number.isFinite(st) ? st : LIM.stepDefault, LIM.stepMin, LIM.stepMax);
+  $('gap').value = clamp(s.gap == null ? LIM.gapDefault : parseInt(s.gap, 10), LIM.gapMin, LIM.gapMax);
+  t0 = performance.now();
+  syncScrollUI();
+}
+
+const round2 = v => Math.round(v * 100) / 100;
+
+// The server owns the limits, but only DOWNWARD. A server that still says
+// speed goes to 60 is describing a panel that freezes, so its ceiling is
+// ignored and the stale build is named instead of quietly obeyed.
+function readScrollLimits(l) {
+  const s = l.scroll || {}, lim = s.limits || {}, def = s.defaults || {}, flat = l.scroll_limits || {};
+  // null must NOT count as a number here: Number(null) is 0, and a missing
+  // limit read as 0 is how the step box arrived with min 0, max 0, value 0.
+  const num = (...vals) => {
+    for (const v of vals) {
+      if (v == null || v === '') continue;
+      const n = Number(v);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  };
+  const pair = k => Array.isArray(lim[k]) ? lim[k] : [];
+  const [spLo, spHi] = pair('speed'), [stLo, stHi] = pair('step'), [gpLo, gpHi] = pair('gap');
+
+  const srvSpeedMax = num(spHi, flat.speed_max);
+  staleLimits = srvSpeedMax != null && srvSpeedMax > HARD_SPEED_MAX;
+  if (staleLimits) {
+    // A server still quoting columns per second is describing a different unit
+    // as well as a different ceiling, so NONE of its speed numbers transfer: a
+    // min of 1 col/sec read as 1 update/sec would pin the box to the one speed
+    // that freezes the panel. Which is exactly what it did on first run.
+    LIM.speedMax = HARD_SPEED_MAX; LIM.speedMin = 0.05; LIM.speedDefault = 0.7;
+  } else {
+    LIM.speedMax = srvSpeedMax != null ? Math.min(HARD_SPEED_MAX, srvSpeedMax) : HARD_SPEED_MAX;
+    LIM.speedMin = clamp(num(spLo, flat.speed_min) ?? 0.05, 0.01, LIM.speedMax);
+    const srvSpeedDef = num(def.speed, flat.speed_default);
+    LIM.speedDefault = (srvSpeedDef != null && srvSpeedDef >= LIM.speedMin && srvSpeedDef <= LIM.speedMax)
+      ? srvSpeedDef : clamp(0.7, LIM.speedMin, LIM.speedMax);
+  }
+
+  LIM.stepMin = num(stLo, flat.step_min) ?? 1;
+  LIM.stepMax = num(stHi, flat.step_max) ?? 8;
+  const srvStepDef = num(def.step, flat.step_default);
+  LIM.stepDefault = (srvStepDef != null && srvStepDef >= LIM.stepMin && srvStepDef <= LIM.stepMax)
+    ? srvStepDef : clamp(4, LIM.stepMin, LIM.stepMax);
+
+  LIM.gapMin = num(gpLo, flat.gap_min) ?? 0;
+  LIM.gapMax = num(gpHi, flat.gap_max) ?? 64;
+  LIM.gapDefault = num(def.gap, flat.gap_default) ?? 8;
+
+  const spd = $('spd'), stp = $('stp'), gap = $('gap');
+  spd.min = LIM.speedMin; spd.max = LIM.speedMax;
+  stp.min = LIM.stepMin;  stp.max = LIM.stepMax;
+  gap.min = LIM.gapMin;   gap.max = LIM.gapMax;
+  spd.value = round2(clamp(parseFloat(spd.value) || LIM.speedDefault, LIM.speedMin, LIM.speedMax));
+  stp.value = clamp(parseInt(stp.value, 10) || LIM.stepDefault, LIM.stepMin, LIM.stepMax);
+  gap.value = clamp(parseInt(gap.value, 10) || LIM.gapDefault, LIM.gapMin, LIM.gapMax);
+}
+
+// Seconds in words. At these speeds a loop can run to minutes, and "94.3s" is a
+// number the eye has to convert before it means anything.
+function secs(v) {
+  if (!Number.isFinite(v) || v <= 0) return '0s';
+  if (v < 10) return (Math.round(v * 10) / 10) + 's';
+  if (v < 90) return Math.round(v) + 's';
+  const m = Math.floor(v / 60), s = Math.round(v - m * 60);
+  return s ? `${m}m ${s}s` : `${m}m`;
+}
+
+// What one update actually moves. 4 columns is a 3-wide character plus its
+// spacing, which is why 4 is the default: the message walks a character at a
+// time rather than gliding.
+function stepPhrase(st) {
+  if (st === 4) return 'one character';
+  if (st === 1) return 'one column';
+  if (st === 8) return 'two characters';
+  return st + ' columns';
+}
+
+function syncScrollUI() {
+  $('scrollOn').classList.toggle('on', scrollOn);
+  $('dirL').classList.toggle('on', scrollDir === 'left');
+  $('dirR').classList.toggle('on', scrollDir === 'right');
+  for (const id of ['spd','stp','gap','dirL','dirR']) $(id).disabled = !scrollOn;
+  $('capNote').innerHTML = 'The cube accepts about <b>60 commands a minute</b>, and past that '
+    + 'the panel freezes on its last frame instead of scrolling faster, so speed stops at '
+    + round2(LIM.speedMax) + ` update${LIM.speedMax === 1 ? '' : 's'} a second. `
+    + 'Step is how far each update moves: 4 columns is one character.'
+    + (staleLimits
+        ? ' <b>This server is an older build</b> that still advertises the old limits and will refuse a step, so restart it before sending.'
+        : '');
+  const cw = $('cw');
+  cw.min = regionW; cw.max = Math.max(maxW, W, regionW);
+  cw.value = W;
+  $('cwVal').textContent = W + ' cols' + (W > regionW ? ` (panel is ${regionW})` : '');
+  $('cwReset').disabled = W === regionW;
+  $('canvasSize').textContent = W > regionW
+    ? `${W} x ${H}, window ${regionW}` : `${W} x ${H}`;
+  const period = W + (scrollOn ? gapVal() : 0);
+  if (scrollOn) {
+    const sp = speedVal(), st = stepVal();
+    // A loop is however many updates it takes to walk the whole period. It does
+    // not divide evenly at every step, and the ceiling is the honest answer:
+    // the last update of a lap is a short one, not a missing one.
+    const updates = Math.max(1, Math.ceil(period / st));
+    $('pvInfo').textContent =
+      `${stepPhrase(st)} every ${secs(1 / sp)}, ${secs(updates / sp)} per loop`;
+    $('pvDetail').textContent =
+      `${regionW} of ${W} columns visible, moving ${scrollDir} · ${st} col/update at `
+      + `${round2(sp)} updates/sec · gap ${gapVal()} · repeats every ${period} cols `
+      + `(${updates} updates, about ${Math.round(sp * 60)} commands a minute)`;
+  } else {
+    $('pvInfo').textContent = W > regionW
+      ? `scroll is off, so the panel shows the first ${regionW} columns and clips the rest`
+      : `${W} x ${H} fits the panel exactly, nothing to scroll`;
+    $('pvDetail').textContent = '';
+  }
+  $('pvNote').textContent = scrollOn
+    ? 'Top: what the panel shows, stepping at the real rate. Bottom: the whole canvas, with the panel window marked.'
+    : 'Turn Scroll on to walk the panel window across a wider canvas.';
+  sizePreview();
+  pvDirty = true;
+}
+
+$('scrollOn').onclick = () => {
+  scrollOn = !scrollOn;
+  if (scrollOn) {
+    t0 = performance.now();
+    if (W === regionW) say('scroll is on, now widen the canvas so there is something to scroll through');
+  }
+  syncScrollUI();
+};
+$('dirL').onclick = () => { scrollDir = 'left'; t0 = performance.now(); syncScrollUI(); };
+$('dirR').onclick = () => { scrollDir = 'right'; t0 = performance.now(); syncScrollUI(); };
+$('spd').oninput = () => { t0 = performance.now(); syncScrollUI(); };
+$('stp').oninput = () => { t0 = performance.now(); syncScrollUI(); };
+$('gap').oninput = syncScrollUI;
+$('cw').oninput = () => {
+  const w = clamp(parseInt($('cw').value, 10) || regionW, regionW, Math.max(maxW, regionW));
+  if (w !== W) resize(w, H);
+  else syncScrollUI();
+};
+$('cwReset').onclick = () => { if (W !== regionW) resize(regionW, H); };
+
+// ---- preview -------------------------------------------------------------
+
+let t0 = performance.now(), pvDirty = true, lastOffset = -1;
+const DPR = () => Math.min(2, window.devicePixelRatio || 1);
+
+function fitCanvas(c, w, h) {
+  const d = DPR();
+  if (c.width !== Math.round(w*d) || c.height !== Math.round(h*d)) {
+    c.width = Math.round(w*d); c.height = Math.round(h*d);
+  }
+  c.style.width = w + 'px'; c.style.height = h + 'px';
+  const ctx = c.getContext('2d');
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  return ctx;
+}
+
+let winCell = 16, stripCell = 5;
+
+function sizePreview() {
+  const avail = Math.max(160, $('pvWin').parentElement.clientWidth - 4);
+  winCell = clamp(Math.floor((avail - 10) / regionW), 6, 22);
+  const period = W + (scrollOn ? gapVal() : 0);
+  // The strip shows the WHOLE loop, so it has to fit the card whatever the
+  // period is. Fractional columns are accepted rather than overflowing: a
+  // canvas that pushed the strip past the card would give the page a second
+  // scrollbar, and that is not a trade worth making for a crisper strip.
+  stripCell = clamp((avail - 8) / period, 0.3, 10);
+}
+
+function periodNow() { return W + (scrollOn ? gapVal() : 0); }
+
+// THE PREVIEW MUST NOT FLATTER THE HARDWARE. It used to glide a column a frame,
+// which is a motion this panel cannot produce: what actually happens is one
+// update a second or so, each jumping `step` columns. So count whole updates
+// elapsed and multiply by step. A preview that shows a glide is worse than no
+// preview, because the gap between the two is what cost this feature an
+// afternoon.
+function offsetNow() {
+  const period = periodNow();
+  if (!scrollOn || period <= 0) return 0;
+  const updates = Math.floor((performance.now() - t0) / 1000 * speedVal());
+  const o = ((updates * stepVal()) % period + period) % period;
+  return scrollDir === 'right' ? (period - o) % period : o;
+}
+
+// Column `src` of the loop: inside the canvas it is the drawing, past it are the
+// gap's blank columns. This is the contract's own wrap, so the preview and the
+// panel agree by construction.
+function colAt(src) {
+  const period = periodNow();
+  const s = ((src % period) + period) % period;
+  return s < W ? s : -1;
+}
+
+function drawWindow(offset) {
+  const cell = winCell, pad = 5;
+  const ctx = fitCanvas($('pvWin'), regionW*cell + pad*2, H*cell + pad*2);
+  ctx.fillStyle = '#0c0e11';
+  ctx.fillRect(0, 0, regionW*cell + pad*2, H*cell + pad*2);
+  for (let x = 0; x < regionW; x++) {
+    const s = colAt(offset + x);
+    for (let y = 0; y < H; y++) {
+      const c = s < 0 ? [0,0,0] : px[y*W + s];
+      ctx.fillStyle = rgb2hex(c || [0,0,0]);
+      ctx.fillRect(pad + x*cell + 1, pad + y*cell + 1, cell - 2, cell - 2);
+    }
+  }
+}
+
+function drawStrip(offset) {
+  const period = periodNow(), cell = stripCell, pad = 4;
+  // Rows keep a floor of their own: a very long loop squeezes the columns thin,
+  // and a strip one pixel tall would say nothing at all.
+  const row = Math.max(cell, 3);
+  const w = period*cell + pad*2, h = H*row + pad*2;
+  const ctx = fitCanvas($('pvStrip'), w, h);
+  ctx.fillStyle = '#0c0e11';
+  ctx.fillRect(0, 0, w, h);
+  // The gap sits behind a slightly lighter ground so it reads as "deliberately
+  // blank" rather than "the drawing stopped".
+  if (period > W) {
+    ctx.fillStyle = '#171a20';
+    ctx.fillRect(pad + W*cell, pad, (period - W)*cell, H*row);
+  }
+  for (let x = 0; x < W; x++) {
+    for (let y = 0; y < H; y++) {
+      const c = px[y*W + x] || [0,0,0];
+      if (!c[0] && !c[1] && !c[2]) continue;
+      ctx.fillStyle = rgb2hex(c);
+      ctx.fillRect(pad + x*cell, pad + y*row, Math.max(cell, 1), row);
+    }
+  }
+  // The window, drawn in two pieces when it straddles the wrap.
+  ctx.strokeStyle = 'rgba(255,112,0,.95)';
+  ctx.lineWidth = 2;
+  const first = Math.min(regionW, period - offset);
+  ctx.strokeRect(pad + offset*cell - 1, pad - 1, first*cell + 2, H*row + 2);
+  if (regionW > first) ctx.strokeRect(pad - 1, pad - 1, (regionW - first)*cell + 2, H*row + 2);
+}
+
+function tick() {
+  const o = offsetNow();
+  if (pvDirty || o !== lastOffset) {
+    lastOffset = o; pvDirty = false;
+    drawWindow(o); drawStrip(o);
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// ---- mode and layout -----------------------------------------------------
+
 function currentSplit() {
   if (!layout || !layout.splits) return null;
   const v = $('split').value;
   return layout.splits.find(s => `${s.share}/${s.total}` === v) || layout.splits[0];
+}
+
+// The server names the ceiling (layout.scroll.max_w, and per mode as
+// canvas.<mode>.scroll_max_w). A server that does not yet say gets a sane
+// default, so the control stays usable instead of pinned to the panel width.
+function readMaxW(l) {
+  const cell = (l.canvas || {})[mode === 'takeover' ? 'takeover' : 'session'] || {};
+  const s = l.scroll || {};
+  for (const v of [cell.scroll_max_w, cell.max_w, s.max_w, l.max_canvas_w, l.max_w]) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n >= 20) return Math.min(512, Math.floor(n));
+  }
+  return 120;
+}
+
+// layout.animation is an object, so its truthiness says nothing: only its
+// running flag does.
+function readAnimating(l) {
+  const a = l.animation;
+  if (a && typeof a === 'object') return !!a.running;
+  return !!(a || l.animating || l.scrolling);
+}
+
+// Called whenever the panel slice changes. A canvas the user widened on purpose
+// survives; one that was merely sitting at the old panel width follows it.
+function setRegion(w, h) {
+  const wasFit = (W === regionW);
+  const changed = (w !== regionW || h !== H);
+  regionW = w;
+  const nw = (wasFit || W < w) ? w : W;
+  if (nw !== W || h !== H) resize(nw, h);
+  else if (changed) buildGrid();
+  else syncScrollUI();
 }
 
 function setMode(m) {
@@ -214,8 +670,8 @@ function setMode(m) {
     ? 'Your drawing takes the right part of the panel; every live session shares what is left. Stays until a session starts or ends.'
     : 'Takes the whole panel. Claude takes it back the moment any session changes colour.';
   if (!layout) return;
-  if (m === 'takeover') { const c = layout.canvas.takeover; resize(c.w, c.h); }
-  else { const s = currentSplit(); if (s) resize(s.w, s.h); }
+  if (m === 'takeover') { const c = layout.canvas.takeover; setRegion(c.w, c.h); }
+  else { const s = currentSplit(); if (s) setRegion(s.w, s.h); }
 }
 $('mSession').onclick = () => setMode('session');
 $('mTakeover').onclick = () => setMode('takeover');
@@ -226,10 +682,14 @@ async function loadLayout() {
     const r = await fetch(API + '/api/layout');
     layout = await r.json();
     if (layout.error) { $('status').textContent = 'status-light error: ' + layout.error; return; }
+    maxW = readMaxW(layout);
+    readScrollLimits(layout);
+    syncScrollUI();
     const s = layout.sessions || [];
     $('status').textContent =
       `${s.length} session${s.length===1?'':'s'} (${s.map(x=>x.state).join(', ') || 'none'}) · panel ${layout.panel.w}x${layout.panel.h}`
-      + (layout.override ? ` · showing a ${layout.override.mode} drawing` : '');
+      + (layout.override ? ` · showing a ${layout.override.mode} drawing` : '')
+      + (readAnimating(layout) ? ' · scrolling' : '');
     const sw = $('swatches'); sw.innerHTML = '';
     const cols = {...(layout.colors||{}), white:0xFFFFFF, black:0x000000};
     for (const [name, v] of Object.entries(cols)) {
@@ -253,28 +713,267 @@ async function loadLayout() {
       if (!sel.value && sel.options.length) sel.selectedIndex = 0;
     }
     const c = mode === 'takeover' ? layout.canvas.takeover : currentSplit();
-    if (c && (c.w !== W || c.h !== H)) resize(c.w, c.h);
+    if (c) setRegion(c.w, c.h);
   } catch (e) {
-    $('status').textContent = 'cannot reach the PC service — is clyde-server running?';
+    $('status').textContent = 'cannot reach the PC service, is clyde-server running?';
   }
 }
 
+// ---- what is on the panel ------------------------------------------------
+
+// Two INDEPENDENT things can pin a block, and a fix that handles one of them
+// works half the time:
+//   1. a slot file, %TEMP%\claude-status-light\<session>.state, where yellow and
+//      red are exempt from the 30 minute sweep and get 4 hours, because a
+//      session waiting on a prompt fires one hook and then goes quiet;
+//   2. a GHOST, a background task .output file that cannot be opened
+//      exclusively, which counts as a running task for 24 hours with no slot
+//      file anywhere to delete. That was the real cause on 2026-09-08.
+// So the report's two line shapes are merged PER SESSION rather than listed as
+// two separate things to chase.
+const GHOST_MIN_AGE = 10;    // -MinAgeMinutes in clear-light.ps1
+const SLOT_STALE_MIN = 30;   // the ordinary sweep, which yellow and red skip
+// Each /api/sessions call costs a PowerShell start of about 300ms, so it rides
+// the existing 8s layout poll at every third tick instead of getting a timer of
+// its own.
+const SESSION_POLL_EVERY = 3;
+let sessTick = 0, sessBusy = false;
+
+const esc = s => String(s).replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function saySess(t, cls='') { const m = $('sessMsg'); m.textContent = t; m.className = 'msg ' + cls; }
+
+// Minutes in words. The stuck ghost today was "361 min", which is a number the
+// eye has to convert before it means anything.
+function mins(m) {
+  if (!Number.isFinite(m) || m < 1) return 'under a minute';
+  if (m < 60) return m + ' min';
+  const h = Math.floor(m / 60), r = m % 60;
+  return r ? `${h}h ${r}m` : `${h}h`;
+}
+
+// The panel's own colour for a state where the server names one, so the dot
+// beside a row is the colour of the block it is talking about.
+function stateHex(state) {
+  // A ghost has no slot file and so no state of its own, but the panel is
+  // painting it as a busy session, and busy is yellow. A grey dot beside it
+  // would describe a block that is not the colour it says.
+  const key = (state === 'busy' || !state) ? 'yellow' : state;
+  const v = ((layout || {}).colors || {})[key];
+  if (v != null) return '#' + Number(v).toString(16).padStart(6, '0');
+  return ({ yellow: '#ffd000', red: '#ff4d4d', green: '#00ff64', blue: '#3aa0ff' })[state]
+    || '#6b7383';
+}
+
+// clear-light.ps1 prints exactly these two rows under WHAT IS ON THE PANEL:
+//   slot   <id>  <state padded to 7>  last hook <n> min ago
+//   ghost  <id>  busy from <n> locked task file(s), oldest <n> min
+// The state is padded, so it can also be BLANK when the state file is empty;
+// matching on "last hook" rather than on a second word survives that.
+function parseReport(text) {
+  const by = new Map();
+  const get = id => { if (!by.has(id)) by.set(id, { id, slot: null, ghost: null }); return by.get(id); };
+  let empty = false;
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const l = raw.trim();
+    if (/^nothing, the panel is showing no sessions$/i.test(l)) { empty = true; continue; }
+    let m = l.match(/^slot\s+(\S+)\s+(.*?)\s*last hook\s+(\d+)\s+min ago$/i);
+    if (m) { get(m[1]).slot = { state: m[2].trim() || 'unknown', age: +m[3] }; continue; }
+    m = l.match(/^ghost\s+(\S+)\s+busy from\s+(\d+)\s+locked task file\(s\), oldest\s+(\d+)\s+min$/i);
+    if (m) { get(m[1]).ghost = { files: +m[2], age: +m[3] }; }
+  }
+  return { rows: [...by.values()], empty };
+}
+
+// What the script WILL do to this row, not what would be nice. A ghost under
+// -MinAgeMinutes is skipped on purpose, because renaming the output of a task
+// that is genuinely running would take it away from whatever is reading it.
+function verdict(r) {
+  const slotStuck = r.slot && r.slot.age >= SLOT_STALE_MIN;
+  const ghostStuck = r.ghost && r.ghost.age >= GHOST_MIN_AGE;
+  const youngGhost = r.ghost && r.ghost.age < GHOST_MIN_AGE;
+  const canClear = !!r.slot || ghostStuck;
+  let tag = 'live', cls = 'live', note = '';
+  if (ghostStuck || slotStuck) {
+    tag = 'stuck'; cls = 'stuck';
+    note = ghostStuck
+      ? 'a held task file counts as a running task for 24 hours, so this block will not age out'
+      : 'yellow and red slots skip the 30 minute sweep and sit for 4 hours';
+  } else if (youngGhost && !r.slot) {
+    tag = 'working'; cls = '';
+    note = `under ${GHOST_MIN_AGE} minutes old, so Clear leaves it alone in case the task is genuinely running`;
+  } else {
+    note = 'painted recently, nothing to do';
+  }
+  return { tag, cls, note, canClear, stuck: !!(ghostStuck || slotStuck) };
+}
+
+function pins(r) {
+  const out = [];
+  if (r.slot) out.push(`slot ${r.slot.state}, last hook ${mins(r.slot.age)} ago`);
+  if (r.ghost) out.push(`ghost, ${r.ghost.files} locked task file${r.ghost.files === 1 ? '' : 's'}, oldest ${mins(r.ghost.age)}`);
+  return out.join(' · ');
+}
+
+function renderSessions(d) {
+  const box = $('sessList');
+  box.innerHTML = '';
+  if (!d || d.ok === false || d.error) {
+    $('sessCount').textContent = 'could not read the panel';
+    box.innerHTML = `<small style="color:var(--bad)">${esc((d && d.error) || 'clear-light.ps1 did not answer')}</small>`;
+    return;
+  }
+  const { rows, empty } = parseReport(d.report);
+  rows.sort((a, b) => {
+    const ax = Math.max(a.slot ? a.slot.age : -1, a.ghost ? a.ghost.age : -1);
+    const bx = Math.max(b.slot ? b.slot.age : -1, b.ghost ? b.ghost.age : -1);
+    return bx - ax;
+  });
+  const stuck = rows.filter(r => verdict(r).stuck).length;
+  $('sessCount').textContent = rows.length
+    ? `${rows.length} block${rows.length === 1 ? '' : 's'}, ${stuck} stuck`
+    : (empty ? 'nothing on the panel' : 'nothing on the panel');
+  $('sessCount').classList.toggle('live', stuck > 0);
+  $('sessClear').disabled = !rows.some(r => verdict(r).canClear);
+  if (!rows.length) {
+    box.innerHTML = '<div class="none">No session has a block right now, so there is nothing stuck.</div>';
+    return;
+  }
+  for (const r of rows) {
+    const v = verdict(r);
+    const st = r.slot ? r.slot.state : 'busy';
+    const row = document.createElement('div');
+    row.className = 's' + (v.stuck ? ' stuck' : '');
+    row.innerHTML =
+      `<span class="dot" style="background:${stateHex(st)}"></span>`
+      + `<span class="id">${esc(r.id)}</span>`
+      + `<span class="tag ${v.cls}">${v.tag}</span>`
+      + `<span class="why">${esc(pins(r))}<br>${esc(v.note)}</span>`;
+    const b = document.createElement('button');
+    b.textContent = 'Clear';
+    if (v.canClear) {
+      b.className = v.stuck ? 'danger' : '';
+      b.title = `Clear ${r.id}: its slot file and any task file older than ${GHOST_MIN_AGE} minutes`;
+      b.onclick = () => doClear(r.id, b);
+    } else {
+      b.disabled = true;
+      b.title = `Nothing here for the script to take: the ghost is under ${GHOST_MIN_AGE} minutes old and there is no slot file`;
+    }
+    row.appendChild(b);
+    box.appendChild(row);
+  }
+}
+
+async function loadSessions() {
+  if (sessBusy) return;
+  sessBusy = true;
+  try {
+    renderSessions(await (await fetch(API + '/api/sessions')).json());
+  } catch (e) {
+    $('sessCount').textContent = 'cannot reach the PC service';
+    $('sessList').innerHTML = '<small style="color:var(--bad)">could not ask what is pinning a block, is clyde-server running?</small>';
+  } finally { sessBusy = false; }
+}
+
+// The report inside a clear response describes the panel BEFORE the clear ran,
+// so it is read for what was done and the list is then asked again rather than
+// re-rendered from it.
+function clearSummary(text) {
+  const out = { removed: 0, moved: 0, skipped: 0, failed: [], nomatch: null };
+  let inClear = false;
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const l = raw.trim();
+    const nm = l.match(/^No session on the panel starts with '(.*)'/i);
+    if (nm) { out.nomatch = nm[1]; continue; }
+    if (/^CLEARING$/i.test(l)) { inClear = true; continue; }
+    if (/^REPAINTING$/i.test(l)) { inClear = false; continue; }
+    if (!inClear || !l) continue;
+    if (/^removed slot/i.test(l)) out.removed++;
+    else if (/^moved aside/i.test(l)) out.moved++;
+    else if (/^skipped/i.test(l)) out.skipped++;
+    else if (/^FAILED/i.test(l)) out.failed.push(l);
+  }
+  return out;
+}
+
+function clearSentence(s) {
+  if (s.nomatch != null) return `nothing on the panel starts with "${s.nomatch}", so nothing changed`;
+  const parts = [];
+  if (s.removed) parts.push(`${s.removed} slot${s.removed === 1 ? '' : 's'} removed`);
+  if (s.moved) parts.push(`${s.moved} ghost file${s.moved === 1 ? '' : 's'} moved aside`);
+  if (s.skipped) parts.push(`${s.skipped} left alone for being under ${GHOST_MIN_AGE} minutes old`);
+  if (!parts.length) return 'nothing needed clearing';
+  return parts.join(', ') + ', and the panel was repainted';
+}
+
+async function doClear(session, btn) {
+  const was = btn ? btn.textContent : null;
+  if (btn) { btn.disabled = true; btn.textContent = 'clearing…'; }
+  saySess(session ? `clearing ${session}…` : 'clearing everything stale…');
+  try {
+    const r = await fetch(API + '/api/clear', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(session ? { session } : {})
+    });
+    const d = await r.json();
+    if (!r.ok || d.ok === false) { saySess(d.error || 'clear-light.ps1 failed', 'err'); }
+    else {
+      const s = clearSummary(d.report);
+      saySess(clearSentence(s) + (s.failed.length ? `. ${s.failed.join('; ')}` : ''),
+        s.failed.length ? 'err' : 'ok');
+    }
+  } catch (e) {
+    saySess('failed: ' + e, 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = was; }
+    // Repainting takes a moment on the server side, so ask again afterwards
+    // rather than trusting the pre-clear report that came back with it.
+    await loadSessions();
+    loadLayout();
+  }
+}
+
+$('sessRefresh').onclick = () => { saySess(''); loadSessions(); };
+$('sessClear').onclick = e => doClear(null, e.target);
+$('sessSafe').innerHTML =
+  'Clearing is <b>safe</b>: a live session re-earns its block on its next hook, so the worst case is a '
+  + `block missing for a few seconds. A ghost task file under ${GHOST_MIN_AGE} minutes old is left where it is, `
+  + 'because it may be a task that is genuinely still running.';
+
+// ---- sending -------------------------------------------------------------
+
 $('send').onclick = async () => {
   say('sending…');
+  const sc = scrollPayload();
   try {
     const r = await fetch(API + '/api/override', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify(Object.assign({ mode, w: W, h: H, pixels: px },
         mode === 'session' && currentSplit()
-          ? { share: currentSplit().share, total: currentSplit().total } : {}))
+          ? { share: currentSplit().share, total: currentSplit().total } : {},
+        sc ? { scroll: sc } : {}))
     });
     const d = await r.json();
     if (!r.ok) {
-      say(d.error + (d.expected ? ` (expected ${d.expected.w}x${d.expected.h})` : ''), 'err');
+      const err = String(d.error || '');
+      // An older clyde-server refuses unknown scroll keys outright, so a POST
+      // carrying `step` is rejected by name. Say so, rather than leaving it
+      // looking like the drawing was wrong.
+      const oldStep = sc && /step/i.test(err) && /unknown/i.test(err);
+      say(err + (d.expected ? ` (expected ${d.expected.w} x ${d.expected.h})` : '')
+          + (d.hint ? `. ${d.hint}` : '')
+          + (oldStep ? '. This clyde-server predates the step control, so restart it and send again.' : '')
+          + (!oldStep && W > regionW ? '. A canvas wider than the panel needs a clyde-server that understands scroll, so restart it if it is still the old one.' : ''), 'err');
       await loadLayout();
       return;
     }
-    say(`on the cube as a ${d.mode} drawing`, 'ok');
+    const notes = (d.notes || []).join('; ');
+    const anim = d.animation && d.animation.running === false ? ', but nothing is animating it yet' : '';
+    say((sc
+      ? `on the cube as a scrolling ${d.mode} drawing, ${stepPhrase(sc.step)} every ${secs(1 / sc.speed)} ${sc.dir}${anim}`
+      : `on the cube as a ${d.mode} drawing`) + (notes ? ` (${notes})` : ''),
+      anim ? 'err' : 'ok');
     loadLayout();
   } catch (e) { say('failed: ' + e, 'err'); }
 };
@@ -287,6 +986,8 @@ $('revert').onclick = async () => {
   } catch (e) { say('failed: ' + e, 'err'); }
 };
 
+// ---- frames --------------------------------------------------------------
+
 async function loadFrames() {
   const box = $('frames');
   try {
@@ -295,15 +996,20 @@ async function loadFrames() {
     if (!d.frames.length) { box.innerHTML = '<small style="color:var(--dim)">none saved yet</small>'; return; }
     for (const f of d.frames) {
       const row = document.createElement('div'); row.className = 'f';
-      row.innerHTML = `<span>${f.name} <small>${f.w}x${f.h}</small></span>`;
+      row.innerHTML = `<span>${f.name} <small>${f.w}x${f.h}${f.scroll ? ' · scrolls' : ''}</small></span>`;
       const load = document.createElement('button'); load.textContent = 'Load';
       load.onclick = async () => {
         const fr = await (await fetch(API + '/api/frames/' + encodeURIComponent(f.name))).json();
-        if (fr.w !== W || fr.h !== H) {
-          resize(fr.w, fr.h);
-          say(`loaded at ${fr.w}x${fr.h}, which is not the current canvas — switch mode or redraw before sending`, 'err');
-        } else say(`loaded ${fr.name}`, 'ok');
+        if (fr.w !== W || fr.h !== H) resize(fr.w, fr.h);
         px = fr.pixels.map(p => [...p]); paintAll();
+        applyScroll(fr.scroll || null);
+        if (fr.h !== H) {
+          say(`loaded at ${fr.w}x${fr.h}, which is a different height to this panel, so redraw before sending`, 'err');
+        } else if (fr.w > regionW && !fr.scroll) {
+          say(`loaded ${fr.name} at ${fr.w} wide, which is wider than the ${regionW}-wide panel; turn Scroll on or the extra columns are clipped`, 'err');
+        } else if (fr.w < regionW) {
+          say(`loaded ${fr.name} at ${fr.w} wide, narrower than the ${regionW}-wide panel, so widen it or switch mode before sending`, 'err');
+        } else say(`loaded ${fr.name}${fr.scroll ? ' with its scroll settings' : ''}`, 'ok');
       };
       const del = document.createElement('button'); del.textContent = 'Delete'; del.className = 'danger';
       del.onclick = async () => {
@@ -318,10 +1024,10 @@ async function loadFrames() {
 
 // The away frame is the whole panel: when the PC is asleep there are no
 // sessions to share it with. Drawn at any other size, it is refused rather than
-// stretched.
+// stretched. It is a still frame, so a scrolling canvas cannot be one.
 $('away').onclick = async () => {
   if (W !== 20 || H !== 5) {
-    say(`the away frame is the whole panel (20x5); switch to "Whole panel" and redraw`, 'err');
+    say(`the away frame is the whole panel (20x5) and does not scroll; switch to "Whole panel", set the width back to 20 and redraw`, 'err');
     return;
   }
   try {
@@ -338,17 +1044,31 @@ $('away').onclick = async () => {
 $('save').onclick = async () => {
   const name = $('fname').value.trim();
   if (!name) { say('give it a name first', 'err'); return; }
+  const sc = scrollPayload();
   const r = await fetch(API + '/api/frames', {
     method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ name, w: W, h: H, pixels: px })
+    body: JSON.stringify(Object.assign({ name, w: W, h: H, pixels: px },
+      sc ? { scroll: sc } : {}))
   });
   const d = await r.json();
-  if (!r.ok) { say(d.error, 'err'); return; }
-  say(`saved ${name}`, 'ok'); $('fname').value = ''; loadFrames();
+  if (!r.ok) {
+    const err = String(d.error || '');
+    say(err + (sc && /step/i.test(err) && /unknown/i.test(err)
+      ? '. This clyde-server predates the step control, so restart it and save again.' : ''), 'err');
+    return;
+  }
+  say(`saved ${name}${sc ? ' with its scroll settings' : ''}`, 'ok');
+  $('fname').value = ''; loadFrames();
 };
 
 setMode('session');
-loadLayout().then(loadFrames);
-// Every 8s, not 5: each poll costs a PowerShell start on the server side.
-setInterval(loadLayout, 8000);
+syncScrollUI();
+loadLayout().then(loadFrames).then(loadSessions);
+// Every 8s, not 5: each poll costs a PowerShell start on the server side. ONE
+// timer, not two: /api/sessions rides it at every third tick, so the panel list
+// refreshes about every 24s and the PowerShell cost per minute barely moves.
+setInterval(() => {
+  loadLayout();
+  if (++sessTick % SESSION_POLL_EVERY === 0) loadSessions();
+}, 8000);
 </script>
