@@ -1,2 +1,3 @@
 *.bak-*
 frames/
+__pycache__/

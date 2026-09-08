@@ -97,7 +97,7 @@
 # stronger signal, so watch-app.ps1 darkens on that transition regardless; if
 # terminal work really is still going, its next hook repaints within seconds.
 #
-# Usage: status-light.ps1 <red|yellow|green|off|status|watchdog|prune|layout>
+# Usage: status-light.ps1 <red|yellow|green|off|status|watchdog|prune|layout|animate>
 #
 # MANUAL OVERRIDE. clyde-server.py serves a pixel editor and writes an override
 # file that this script honours when it paints. Two modes:
@@ -105,6 +105,9 @@
 #   takeover - the drawing owns the whole panel, and is dropped the moment the
 #              session composition changes, so the next thing Claude does takes
 #              the panel back.
+#              A `pin` of true suspends that expiry, which is what a ticker
+#              needs: it then runs until something clears it explicitly, and
+#              session state stays off the panel while it does.
 #   session  - the drawing takes a SHARE of the panel and every real session
 #              shares what is left. The share is share/total parts, so 1/2 gives
 #              the drawing half, 2/3 gives it the right two thirds with all the
@@ -116,6 +119,37 @@
 # See Get-Override. The layout verb exists so the editor never has to reimplement
 # Get-Grid and Get-Spans: it asks for the cell size it should draw at.
 #
+# SCROLLING. An override may carry an optional `scroll` block (speed in UPDATES
+# per second, step in columns moved per update, dir left|right, gap in blank
+# columns). With it, the drawing's `w` is allowed to be WIDER than the region it
+# lands in: a window walks across the canvas, wrapping modulo (w + gap) so the
+# tail runs back into the head with `gap` dark columns between, which is what
+# makes it a ticker rather than a slide that ends. Without the block nothing
+# changes, down to the byte.
+#
+# IT IS A FLIP-BOARD, NOT A GLIDE, AND THAT IS THE HARDWARE TALKING. The cube
+# refuses commands after about 25 to 30 on one connection and refills at roughly
+# 68 a minute overall, so a column-per-frame scroll at any readable rate freezes
+# the panel within seconds. So an update moves `step` columns (4 by default, one
+# character of a 3-wide font plus its spacing) and updates land less than once a
+# second. See the scroll configuration block for the measurements.
+#
+# The scroll is driven by the `animate` verb, a resident loop that holds ONE
+# connection open and pushes frames at the scroll rate (arming and pushing must
+# share a socket, and reconnecting per frame costs ~150ms). It is started
+# automatically by the first ordinary paint that sees a scrolling override, see
+# Start-Animator. It spends a BUDGET rather than a frame rate, leaves headroom
+# for the ordinary hook paints, and probes for the quota refusal instead of
+# pushing into the dark, because update_leds never replies and a refused frame
+# is otherwise indistinguishable from a rendered one.
+#
+# While it runs it touches a heartbeat file every frame, and Set-Cube DEFERS to
+# a fresh heartbeat so hook paints stop fighting the animation. Because they
+# defer, the animator has to re-read session state itself, which it does once a
+# second with the same functions the hook path uses. FRESHNESS is the whole
+# check: a heartbeat left behind by a killed animator must never wedge the light,
+# so the file merely existing means nothing.
+#
 # Run from a hook, the event JSON arrives on stdin and the colour is recorded
 # against that session's id. Run by hand with no stdin, the colour is forced
 # onto the bulb directly, ignoring what the sessions want.
@@ -126,7 +160,7 @@
 
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('red', 'yellow', 'green', 'off', 'status', 'watchdog', 'prune', 'layout')]
+    [ValidateSet('red', 'yellow', 'green', 'off', 'status', 'watchdog', 'prune', 'layout', 'animate')]
     [string]$State
 )
 
@@ -248,6 +282,132 @@ $TaskPruneDays = 7
 # Written by clyde-server.py, read on every paint. See Get-Override.
 $OverrideFile = Join-Path $env:TEMP 'claude-status-light.override'
 
+# -- scrolling --
+# Defaults for an override's optional `scroll` block, and the bounds every value
+# is clamped into. A drawing that asks for something outside these is clamped
+# rather than refused: a ticker running at the wrong speed is still readable,
+# and a silently dropped override is not.
+#
+# THE MEASUREMENTS THAT SET THESE NUMBERS (2026-09-08, refillprobe.py). They are
+# not preferences and they are not guesses:
+#
+#   * A held connection is refused after about 25 to 30 commands, with
+#     {"code":-1,"message":"client quota exceeded"}.
+#   * The budget is per CONNECTION: a socket opened the instant another is
+#     refused is served immediately.
+#   * A CLIENT-level cap sits above that. Rotating sockets bought 72 frames over
+#     6 seconds and then fresh connections were refused too.
+#   * The refill: 58 commands spent, 51 seconds locked out. About 68 commands a
+#     MINUTE, which as a one-column-per-frame scroll is 1.1 columns a second.
+#   * activate_fx_mode accepts only "direct". Fifteen other mode strings were
+#     probed and every one came back "invalid params", so there is no on-device
+#     animation to hand the work to.
+#
+# AND THE REASON THIS WAS EXPENSIVE TO FIND: update_leds NEVER REPLIES, so going
+# over the budget is SILENT. The socket keeps accepting frames and the panel
+# simply freezes on the last one it rendered. Every instrument built before this
+# was measured reported success while the panel was dead, because a probe on a
+# FRESH connection gets a FRESH budget and answers "ok" while the held
+# connection's frames are being discarded. Any check of "is the cube keeping up"
+# has to be made ON THE CONNECTION THAT IS PUSHING. See Test-CubeQuota.
+#
+# So `speed` keeps its name but now means UPDATES PER SECOND, and each update
+# moves `step` columns. At step 4 an update advances exactly one character of a
+# 3-wide font plus its spacing, which makes the message walk across the panel a
+# character at a time: a flip-board rather than a glide, and the most motion this
+# hardware can sustain. step 1 is the honest one-column crawl.
+$ScrollDefaultSpeed = 0.7   # UPDATES per second, not columns
+$ScrollMinSpeed = 0.05      # one update every 20s, the slowest worth having
+$ScrollMaxSpeed = 1.0       # above this the panel freezes; the clamp is the hardware
+$ScrollDefaultStep = 4      # columns moved per update: one 3-wide char plus spacing
+$ScrollMinStep = 1
+$ScrollMaxStep = 8
+$ScrollDefaultGap = 8       # blank columns between the tail and the head
+$ScrollMinGap = 0
+$ScrollMaxGap = 64
+
+# THE ANIMATOR'S SHARE OF THE DEVICE, in commands per minute, counting EVERY
+# command it sends: frames, quota probes and the arming of each connection.
+#
+# 40 against a measured refill of about 68 leaves 28 a minute for everything
+# else, and that headroom is the point rather than politeness. The status light
+# still has to paint on hooks, and a hook paint refused on quota leaves the panel
+# stuck showing a ticker that has already been taken down: the drawing outlives
+# the override that asked for it, and nothing on the device can be read back to
+# notice. Spending the whole budget on the animation would make the light lie.
+$AnimateMaxCommandsPerMinute = 40
+
+# Pace the frames at this fraction of the ceiling so the hard limiter is a
+# BACKSTOP that almost never fires rather than the thing setting the rate. A
+# limiter that binds on every frame turns even pacing into a sawtooth, and the
+# whole point of the profile instrumentation is to be able to see the pacing.
+$AnimatePaceFraction = 0.9
+
+# Send one command that DOES reply after this many commands on a connection, and
+# rotate to a fresh one straight after. Two jobs in one command, see
+# Test-CubeQuota: it is the only evidence that the frames just pushed were being
+# served, AND it re-arms direct mode.
+#
+# ROTATING PROACTIVELY IS NOT BELT AND BRACES. The connection budget is 25 to 30
+# commands, so a connection that is only abandoned once a probe FAILS spends the
+# gap between the refusal and the next probe pushing frames into a dead socket:
+# at one probe every 20 commands that is up to fifteen frames, about half a
+# minute of frozen panel, every single connection. Retiring the connection while
+# it is still known good costs one command and cannot freeze anything.
+$AnimateProbeEvery = 20
+
+# A fresh connection refused as well means the CLIENT cap is spent, not the
+# connection's, and the only cure is time: 51 seconds measured. Waiting it out is
+# the fast path. Hammering it keeps the refill from ever arriving, and that is
+# what turns a five second stall into a dead panel.
+$AnimateQuotaBackoffMs = 55000
+
+# The animator's heartbeat, refreshed every frame with its pid and the time.
+# Set-Cube defers to it while it is FRESH. Never treat it as a lock: a process
+# that died leaves the file behind, and the age is what makes that harmless.
+$AnimateFile = Join-Path $env:TEMP 'claude-status-light.animating'
+$AnimateFreshSeconds = 3
+
+# Drop this file to ask a running animator to stop at its next frame. It deletes
+# the file itself, so the request cannot outlive the stop it asked for.
+$AnimateStopFile = Join-Path $env:TEMP 'claude-status-light.animate-stop'
+
+# NO INTERVAL RE-ARM ANY MORE, and the deletion is deliberate. Direct mode used
+# to be re-armed every 30 seconds as insurance against firmware dropping it, on
+# the reasoning that the device is write-only and a dropped mode would show up
+# only as a panel that had stopped moving.
+#
+# A RE-ARM COSTS EXACTLY WHAT A FRAME COSTS. At the rate the budget now allows,
+# a timer re-arm every 30 seconds is about one command in eighteen spent on
+# insurance against something never observed, and every one of those is a frame
+# the panel does not get. The quota probe already sends activate_fx_mode on the
+# pushing connection every $AnimateProbeEvery commands, which re-arms it as a
+# side effect, so the insurance is still there and now costs nothing extra.
+# Adding a second re-arm on a timer would be paying twice for one guarantee.
+
+# How often the animator re-reads the sessions. The scroll offset advances every
+# frame regardless; this is only about noticing a session starting or turning
+# red, which no hook can show while paints are deferring to the animation.
+$AnimateStateSeconds = 1
+
+# Frame timing instrumentation for the animator. The panel is write-only, so the
+# only way to tell a stutter from a slow scroll is to measure the interval
+# between pushes on this side and see what the distribution looks like. Cheap
+# (one double appended per frame), and the summary lands in the trace on exit.
+$AnimateProfile = $true
+
+# Start the animator from the first ordinary paint that sees a scrolling
+# override, so nothing else has to remember to. Guarded twice: `animate` refuses
+# to run beside a live heartbeat, and the cooldown below stops a crash-looping
+# animator being respawned by every hook.
+$AutoAnimate = $true
+$AnimateSpawnFile = Join-Path $env:TEMP 'claude-status-light.animspawn'
+$AnimateSpawnCooldown = 15
+
+# True only inside the `animate` verb. Set-Cube uses it to tell its own frames
+# apart from a hook trying to paint over the animation.
+$script:IsAnimator = $false
+
 $ActivityFile = Join-Path $env:TEMP 'claude-status-light.activity'
 $CacheFile = Join-Path $env:TEMP 'claude-status-light.state'   # colour on the bulb
 $StateDir  = Join-Path $env:TEMP 'claude-status-light'         # one file per session
@@ -272,36 +432,142 @@ function Write-Trace {
     catch { }
 }
 
-function Send-Yeelight {
-    # One command per connection. The cube drops idle connections and there is
-    # nothing to gain from holding one open between hook events.
-    param([string]$Method, [string]$ParamsJson)
-
+function Open-Cube {
+    # A connected socket, or $null. Everything that talks to the cube goes
+    # through here, because the ONE connection rule is the thing most easily got
+    # wrong: activate_fx_mode arms direct mode for the connection it arrived on,
+    # so a frame pushed down a different socket is answered with "illegal
+    # request". A hook opens one, sends its two calls and closes it; the animator
+    # opens one and keeps it, since reconnecting costs ~150ms and no ticker
+    # survives that per frame.
     $client = New-Object Net.Sockets.TcpClient
     try {
         $ar = $client.BeginConnect($CubeIp, $CubePort, $null, $null)
-        if (-not $ar.AsyncWaitHandle.WaitOne($ConnectMs)) { return $false }
+        if (-not $ar.AsyncWaitHandle.WaitOne($ConnectMs)) { $client.Close(); return $null }
         $client.EndConnect($ar)
         $stream = $client.GetStream()
         $stream.ReadTimeout = 2000
-
-        $msg = '{"id":1,"method":"' + $Method + '","params":' + $ParamsJson + '}' + [char]13 + [char]10
-        $bytes = [Text.Encoding]::UTF8.GetBytes($msg)
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Flush()
-
-        # Read the reply. A write that is never acknowledged is a write that may
-        # not have landed, and this light offers no other way to find out.
-        $buf = New-Object byte[] 1024
-        $n = 0
-        try { $n = $stream.Read($buf, 0, $buf.Length) } catch { return $false }
-        if ($n -le 0) { return $false }
-        $reply = [Text.Encoding]::UTF8.GetString($buf, 0, $n)
-        Write-Trace ("cube $Method -> " + $reply.Trim())
-        return ($reply -match '"result"')
+        return [pscustomobject]@{ Client = $client; Stream = $stream }
     }
-    catch { return $false }
-    finally { $client.Close() }
+    catch {
+        try { $client.Close() } catch { }
+        return $null
+    }
+}
+
+function Close-Cube {
+    param($Conn)
+    if ($null -eq $Conn) { return }
+    try { $Conn.Client.Close() } catch { }
+}
+
+function Send-CubeRaw {
+    # One command, and the RAW reply text back, or $null when nothing came.
+    #
+    # THE REPLY TEXT IS THE ONLY PLACE THE QUOTA REFUSAL EXISTS. It arrives as
+    # {"code":-1,"message":"client quota exceeded"}, which is a REPLY and not a
+    # silence, so the boolean form below cannot tell it apart from a light that
+    # is merely unplugged. Being cut off and being offline call for opposite
+    # reactions, so the animator reads the text. See Test-CubeQuota.
+    param($Conn, [string]$Json)
+
+    if ($null -eq $Conn) { return $null }
+    try {
+        $b = [Text.Encoding]::UTF8.GetBytes($Json + [char]13 + [char]10)
+        $Conn.Stream.Write($b, 0, $b.Length)
+        $Conn.Stream.Flush()
+        $rb = New-Object byte[] 1024
+        $n = 0
+        try { $n = $Conn.Stream.Read($rb, 0, $rb.Length) } catch { return $null }
+        if ($n -le 0) { return $null }
+        return [Text.Encoding]::UTF8.GetString($rb, 0, $n)
+    }
+    catch { return $null }
+}
+
+function Send-CubeJson {
+    # $Read $false for update_leds, which NEVER replies: waiting on it would
+    # stall every frame until the read timeout expires.
+    param($Conn, [string]$Json, [bool]$Read)
+
+    if ($null -eq $Conn) { return $false }
+    if (-not $Read) {
+        try {
+            $b = [Text.Encoding]::UTF8.GetBytes($Json + [char]13 + [char]10)
+            $Conn.Stream.Write($b, 0, $b.Length)
+            $Conn.Stream.Flush()
+            return $true
+        }
+        catch { return $false }
+    }
+
+    # A write that is never acknowledged is a write that may not have landed,
+    # and this light offers no other way to find out.
+    $resp = Send-CubeRaw -Conn $Conn -Json $Json
+    if ($null -eq $resp) { return $false }
+    return ($resp -match '"result"')
+}
+
+function Test-CubeQuota {
+    # 'ok', 'quota' or 'silent', measured ON THE CONNECTION HANDED IN. This is
+    # the animator's only instrument, and the connection is the whole point of
+    # it: the budget is per connection, so asking a FRESH socket whether the cube
+    # is listening always answers yes and tells you nothing about the socket
+    # whose frames are being thrown away.
+    #
+    # activate_fx_mode is the command used because it replies AND re-arms direct
+    # mode, so the probe pays for itself instead of only costing a command.
+    param($Conn)
+
+    $resp = Send-CubeRaw -Conn $Conn -Json '{"id":1,"method":"activate_fx_mode","params":[{"mode":"direct"}]}'
+    if ($null -eq $resp) { return 'silent' }
+    if ($resp -match 'quota') { return 'quota' }
+    if ($resp -match '"result"') { return 'ok' }
+    return 'silent'
+}
+
+function Initialize-CubeDirect {
+    # Power on, then arm direct mode, on the connection frames will be pushed
+    # down. set_power is a no-op on a light that is already on, and it recovers a
+    # panel someone switched off in the Yeelight app without this process being
+    # able to see it.
+    #
+    # The animator does NOT use this. It arms its own connections a command at a
+    # time, because every command it sends has to be counted against a budget and
+    # because it needs to read the arm's REPLY rather than a boolean: a refusal
+    # on a freshly opened socket means the client-level cap is spent, which calls
+    # for waiting out the refill rather than reconnecting. See Test-CubeQuota.
+    param($Conn)
+
+    [void](Send-CubeJson -Conn $Conn -Json '{"id":1,"method":"set_power","params":["on","smooth",300]}' -Read $true)
+    if (-not (Send-CubeJson -Conn $Conn -Json '{"id":1,"method":"activate_fx_mode","params":[{"mode":"direct"}]}' -Read $true)) {
+        Write-Trace 'cube: activate_fx_mode refused'
+        return $false
+    }
+    return $true
+}
+
+function Push-CubeFrame {
+    # The last thing that can be known: update_leds never replies, so a $true
+    # here means "written to the socket", not "rendered".
+    param($Conn, [string]$Frame)
+    return (Send-CubeJson -Conn $Conn -Json ('{"id":1,"method":"update_leds","params":["' + $Frame + '"]}') -Read $false)
+}
+
+function Send-Yeelight {
+    # One command on its own connection, for the calls that do not need direct
+    # mode (set_power off). The cube drops idle connections and there is nothing
+    # to gain from holding one open between hook events.
+    param([string]$Method, [string]$ParamsJson)
+
+    $conn = Open-Cube
+    if ($null -eq $conn) { return $false }
+    try {
+        $ok = Send-CubeJson -Conn $conn -Json ('{"id":1,"method":"' + $Method + '","params":' + $ParamsJson + '}') -Read $true
+        Write-Trace ("cube $Method -> " + $(if ($ok) { 'ok' } else { 'no result' }))
+        return $ok
+    }
+    finally { Close-Cube $conn }
 }
 
 function Get-PixelIndex {
@@ -379,6 +645,183 @@ function Get-Spans {
     return , $spans
 }
 
+function Get-ScrollSpec {
+    # The override's optional `scroll` block, clamped, or $null when it is absent
+    # or unusable.
+    #
+    # ABSENT RETURNS $null RATHER THAN A ZERO-SPEED SPEC, deliberately. An
+    # override with no scroll key has to render byte for byte the way it did
+    # before scrolling existed, and the only way to be sure of that is for the
+    # scrolling code never to run at all.
+    #
+    # Out-of-range values are CLAMPED, not refused. A ticker at the wrong speed
+    # is still readable; a drawing that silently failed to appear is not.
+    #
+    # Idempotent, so it is safe to call on an override that has already been
+    # normalised by Get-Override.
+    param($Ov)
+
+    if ($null -eq $Ov) { return $null }
+    $raw = $null
+    try { $raw = $Ov.scroll } catch { return $null }
+    if ($null -eq $raw) { return $null }
+
+    # SPEED IS A DOUBLE, and it has to be: the ceiling is 1.0 updates a second
+    # and the default is 0.7, so an [int] cast would round every usable value to
+    # 1 or to 0 and then clamp the 0 back up. The old code could cast to [int]
+    # because a speed below 1 column a second was not worth having; a speed above
+    # 1 UPDATE a second is not survivable, which is the opposite problem.
+    $speed = [double]$ScrollDefaultSpeed
+    $step = $ScrollDefaultStep
+    $gap = $ScrollDefaultGap
+    $dir = 'left'
+    try { if ($null -ne $raw.speed) { $speed = [double]$raw.speed } } catch { }
+    try { if ($null -ne $raw.step) { $step = [int]$raw.step } } catch { }
+    try { if ($null -ne $raw.gap) { $gap = [int]$raw.gap } } catch { }
+    try { if ($null -ne $raw.dir) { $dir = ([string]$raw.dir).Trim().ToLowerInvariant() } } catch { }
+
+    if ($speed -lt $ScrollMinSpeed) { $speed = [double]$ScrollMinSpeed }
+    if ($speed -gt $ScrollMaxSpeed) { $speed = [double]$ScrollMaxSpeed }
+    if ($step -lt $ScrollMinStep) { $step = $ScrollMinStep }
+    if ($step -gt $ScrollMaxStep) { $step = $ScrollMaxStep }
+    if ($gap -lt $ScrollMinGap) { $gap = $ScrollMinGap }
+    if ($gap -gt $ScrollMaxGap) { $gap = $ScrollMaxGap }
+    if ($dir -ne 'right') { $dir = 'left' }
+
+    # A canvas WIDER than the region it lands in is the entire point here, so
+    # width is not checked against anything. Height is a different question:
+    # there is nowhere for an extra row to go, and scrolling cannot rescue a
+    # drawing that is simply too tall.
+    $w = 0; $h = 0
+    try { $w = [int]$Ov.w; $h = [int]$Ov.h } catch { return $null }
+    if ($w -lt 1 -or $h -lt 1 -or $h -gt $MatrixH) { return $null }
+
+    return [pscustomobject]@{ speed = $speed; step = $step; dir = $dir; gap = $gap; loop = $true }
+}
+
+function Get-ScrollOffset {
+    # `dir: right` is the same walk read backwards, so the offset is negated and
+    # the modulo in Set-Pixels brings it back into range. Keeping the sign here
+    # means every caller can just hand over a frame counter that only goes up.
+    param($Scroll, [int]$Offset)
+    if ($null -ne $Scroll -and $Scroll.dir -eq 'right') { return - $Offset }
+    return $Offset
+}
+
+function Get-AnimateFrameBudgetMs {
+    # The shortest interval between frames the command budget can sustain, in
+    # milliseconds. Derived, never typed in, because the overhead is structural:
+    # a connection spends $AnimateProbeEvery commands in total and only
+    # ($AnimateProbeEvery - 2) of them are frames, the other two being the arm
+    # and the probe that retires it. So a frame really costs
+    # $AnimateProbeEvery / ($AnimateProbeEvery - 2) commands.
+    #
+    # A configured speed faster than this is SLOWED to it rather than refused.
+    # The alternative is a panel that runs beautifully for five seconds and then
+    # freezes, which is what this whole change exists to stop.
+    $frames = [Math]::Max(1, $AnimateProbeEvery - 2)
+    $cmdsPerFrame = $AnimateProbeEvery / [double]$frames
+    $framesPerMin = ($AnimateMaxCommandsPerMinute * $AnimatePaceFraction) / $cmdsPerFrame
+    if ($framesPerMin -le 0) { return 60000 }
+    return [int][Math]::Ceiling(60000.0 / $framesPerMin)
+}
+
+function Get-BudgetWaitMs {
+    # How long to wait before one more command may be sent, given the times (in
+    # milliseconds on any monotonic clock) of the commands already sent inside
+    # the last minute. 0 means send now. PRUNES $Times in place, so the queue
+    # never grows past the ceiling.
+    #
+    # A ROLLING WINDOW, not a per-frame delay, because the thing being protected
+    # is a refill measured over a minute (58 commands spent, 51 seconds locked
+    # out) rather than a rate limit that resets on a tick. A burst that fits the
+    # average still exhausts the device, and only the window notices that.
+    #
+    # Split out and pure so it can be asserted against a simulated clock: the
+    # honest test of a limiter is a run it must never exceed, and running one
+    # against the real device would cost the very budget it is protecting.
+    param([System.Collections.Generic.Queue[double]]$Times, [double]$NowMs, [int]$PerMinute)
+
+    if ($PerMinute -le 0) { return 60000 }
+    while ($Times.Count -gt 0 -and ($NowMs - $Times.Peek()) -ge 60000) { [void]$Times.Dequeue() }
+    if ($Times.Count -lt $PerMinute) { return 0 }
+    $wait = 60000 - ($NowMs - $Times.Peek())
+    if ($wait -lt 0) { $wait = 0 }
+    return [int][Math]::Ceiling($wait)
+}
+
+function Test-AnimatorLive {
+    # FRESH, never merely present. A killed animator leaves its heartbeat behind,
+    # and treating that file as a lock would wedge the light dark until somebody
+    # noticed and deleted it by hand. The age is what makes a corpse harmless.
+    try {
+        if (-not (Test-Path -LiteralPath $AnimateFile)) { return $false }
+        $age = ((Get-Date) - (Get-Item -LiteralPath $AnimateFile).LastWriteTime).TotalSeconds
+        return ($age -lt $AnimateFreshSeconds)
+    }
+    catch { return $false }
+}
+
+function Get-AnimatorInfo {
+    # pid and heartbeat age for the reporting verbs, or $null when no animator is
+    # live. Same freshness rule as Test-AnimatorLive, on purpose: `status` must
+    # describe the panel the hooks are actually seeing.
+    try {
+        if (-not (Test-Path -LiteralPath $AnimateFile)) { return $null }
+        $fi = Get-Item -LiteralPath $AnimateFile
+        $age = ((Get-Date) - $fi.LastWriteTime).TotalSeconds
+        if ($age -ge $AnimateFreshSeconds) { return $null }
+        $txt = ''
+        try { $txt = (Get-Content -LiteralPath $AnimateFile -Raw -ErrorAction SilentlyContinue) } catch { }
+        $ownerPid = 0
+        if ($null -ne $txt) {
+            $m = [regex]::Match($txt, '\d+')
+            if ($m.Success) { $ownerPid = [int]$m.Value }
+        }
+        return [pscustomobject]@{ pid = $ownerPid; age = $age }
+    }
+    catch { return $null }
+}
+
+function Update-AnimatorHeartbeat {
+    # Rewritten every frame. The CONTENT is for a human reading the file; the
+    # timestamp is what Set-Cube actually tests.
+    try { [System.IO.File]::WriteAllText($AnimateFile, ("$PID " + (Get-Date).ToString('o'))) }
+    catch { }
+}
+
+function Start-Animator {
+    # Nothing else starts the scroll, so the first ordinary paint that sees a
+    # scrolling override launches one detached and gets on with its own frame.
+    #
+    # Two guards, because a spawn from a hook path could otherwise become a
+    # process storm: `animate` refuses to start beside a live heartbeat, and this
+    # cooldown stops an animator that dies immediately being relaunched by every
+    # PreToolUse and PostToolUse in the meantime.
+    if (-not $AutoAnimate) { return }
+    if ([string]::IsNullOrEmpty($PSCommandPath)) { return }
+    try {
+        if (Test-Path -LiteralPath $AnimateSpawnFile) {
+            $age = ((Get-Date) - (Get-Item -LiteralPath $AnimateSpawnFile).LastWriteTime).TotalSeconds
+            if ($age -lt $AnimateSpawnCooldown) { return }
+        }
+        [System.IO.File]::WriteAllText($AnimateSpawnFile, (Get-Date).ToString('o'))
+
+        # Relaunch the SAME host that is running this script. A 5.1 hook that
+        # shelled out to a pwsh that is not installed, or the reverse, would fail
+        # in a way nothing here could see.
+        $exe = $null
+        try { $exe = (Get-Process -Id $PID).Path } catch { }
+        if ([string]::IsNullOrEmpty($exe)) { $exe = 'powershell.exe' }
+
+        Start-Process -FilePath $exe -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', ('"' + $PSCommandPath + '"'), 'animate') | Out-Null
+        Write-Trace 'animator: spawned for scrolling override'
+    }
+    catch { Write-Trace ('animator: spawn failed - ' + $_.Exception.Message) }
+}
+
 function Get-Override {
     # The manual drawing, or $null. Expires it in place when it no longer
     # applies, so nothing else has to think about staleness.
@@ -400,13 +843,26 @@ function Get-Override {
         return $null
     }
 
+    # PINNED overrides do not expire. A ticker is the case that needs it: the
+    # takeover rule below ends a drawing the moment the sessions change, which is
+    # right for "show me this instead" and wrong for something meant to run all
+    # day. Measured 2026-09-08: a ticker survived 20 seconds and was then dropped
+    # by a composition change, which from the outside looks exactly like the
+    # freeze it had just stopped doing.
+    #
+    # The cost is real and deliberate: while a takeover is pinned, session state
+    # is NOT on the panel at all. Nothing expires it, so it takes an explicit
+    # clear (DELETE /api/override, or ticker.py --clear) to get the light back.
+    $pinned = $false
+    if ($null -ne $ov.PSObject.Properties['pin']) { $pinned = [bool]$ov.pin }
+
     $states = @($States)
     $drop = $null
     if ($ov.mode -eq 'takeover') {
-        if ($ov.signature -ne ($states -join ',')) { $drop = 'composition changed' }
+        if (-not $pinned -and $ov.signature -ne ($states -join ',')) { $drop = 'composition changed' }
     }
     elseif ($ov.mode -eq 'session') {
-        if ([int]$ov.sessions -ne $states.Count) { $drop = 'session count changed' }
+        if (-not $pinned -and [int]$ov.sessions -ne $states.Count) { $drop = 'session count changed' }
     }
     else { $drop = "unknown mode '$($ov.mode)'" }
 
@@ -415,26 +871,88 @@ function Get-Override {
         Remove-Item -LiteralPath $OverrideFile -Force -ErrorAction SilentlyContinue
         return $null
     }
+
+    # Normalise the optional scroll block ONCE, here, so every reader downstream
+    # gets clamped values and nothing has to re-validate. A scroll block that
+    # cannot be honoured is replaced by $null rather than dropping the whole
+    # override: the drawing still has something to show, it just holds still.
+    #
+    # Note what is NOT checked: a `w` wider than the region the drawing lands in
+    # used to be nothing but a clipping accident, and with a scroll block it is
+    # the point of the exercise. Only the height still has to fit.
+    $hadScroll = ($null -ne $ov.PSObject.Properties['scroll']) -and ($null -ne $ov.scroll)
+    $spec = Get-ScrollSpec -Ov $ov
+    if ($hadScroll -and $null -eq $spec) {
+        Write-Trace "override: scroll block unusable (h=$($ov.h) must be 1..$MatrixH), drawing will hold still"
+    }
+    Add-Member -InputObject $ov -NotePropertyName 'scroll' -NotePropertyValue $spec -Force
+
     return $ov
 }
 
 function Set-Pixels {
-    # Blit a w*h block of raw RGB (base64) into the panel at $X0,$Y0. Anything
-    # falling outside the panel is clipped rather than wrapping onto the next row.
-    param([byte[]]$Buf, [string]$B64, [int]$W, [int]$H, [int]$X0, [int]$Y0)
+    # Blit a w*h block of raw RGB (base64) into the panel at $X0,$Y0.
+    #
+    # TWO PATHS, and the plain one is left exactly as it was on purpose. Without
+    # -Scroll this is the original blit: anything falling outside the panel is
+    # clipped rather than wrapping onto the next row, and the bytes it writes
+    # must stay identical to what they were before scrolling existed, because an
+    # override with no scroll block is far and away the common case.
+    #
+    # With -Scroll the canvas is deliberately wider than the region it is painted
+    # into, and a window $RegionW wide walks across it. Source columns are taken
+    # modulo ($W + $Gap), so the columns past the end of the canvas are blank:
+    # that is what puts $Gap dark columns between the tail and the head, and it
+    # is the difference between a ticker and a slide that runs out.
+    param([byte[]]$Buf, [string]$B64, [int]$W, [int]$H, [int]$X0, [int]$Y0,
+        [switch]$Scroll, [int]$RegionW = 0, [int]$Offset = 0, [int]$Gap = 0)
 
     try { $src = [Convert]::FromBase64String($B64) } catch { return $false }
     if ($src.Length -lt ($W * $H * 3)) { return $false }
 
+    if (-not $Scroll) {
+        for ($yy = 0; $yy -lt $H; $yy++) {
+            for ($xx = 0; $xx -lt $W; $xx++) {
+                $x = $X0 + $xx
+                $y = $Y0 + $yy
+                if ($x -lt 0 -or $x -ge $MatrixW -or $y -lt 0 -or $y -ge $MatrixH) { continue }
+                $s = ((($yy * $W) + $xx) * 3)
+                $o = (Get-PixelIndex -X $x -Y $y) * 3
+                # Scaled like every other colour: $Brightness is the panel's
+                # output level, not a property of what is being drawn.
+                $Buf[$o] = [byte][int](($src[$s] * $Brightness) / 100)
+                $Buf[$o + 1] = [byte][int](($src[$s + 1] * $Brightness) / 100)
+                $Buf[$o + 2] = [byte][int](($src[$s + 2] * $Brightness) / 100)
+            }
+        }
+        return $true
+    }
+
+    # Default the window to "from here to the right edge", which is what the old
+    # clipping behaviour amounted to for a takeover.
+    if ($RegionW -le 0) { $RegionW = $MatrixW - $X0 }
+    $span = $W + $Gap
+    if ($span -lt 1) { return $false }
+
+    # PowerShell's % keeps the sign of the DIVIDEND, so a `right` scroll would
+    # index off the front of the canvas without this second modulo.
+    $off = ((($Offset % $span) + $span) % $span)
+
     for ($yy = 0; $yy -lt $H; $yy++) {
-        for ($xx = 0; $xx -lt $W; $xx++) {
-            $x = $X0 + $xx
+        for ($dx = 0; $dx -lt $RegionW; $dx++) {
+            $x = $X0 + $dx
             $y = $Y0 + $yy
             if ($x -lt 0 -or $x -ge $MatrixW -or $y -lt 0 -or $y -ge $MatrixH) { continue }
-            $s = ((($yy * $W) + $xx) * 3)
             $o = (Get-PixelIndex -X $x -Y $y) * 3
-            # Scaled like every other colour: $Brightness is the panel's output
-            # level, not a property of what is being drawn.
+            $sx = (($off + $dx) % $span)
+            if ($sx -ge $W) {
+                # A gap column. Written as black rather than skipped: this region
+                # is repainted every frame, and skipping would smear the previous
+                # frame's pixels through the gap.
+                $Buf[$o] = 0; $Buf[$o + 1] = 0; $Buf[$o + 2] = 0
+                continue
+            }
+            $s = ((($yy * $W) + $sx) * 3)
             $Buf[$o] = [byte][int](($src[$s] * $Brightness) / 100)
             $Buf[$o + 1] = [byte][int](($src[$s + 1] * $Brightness) / 100)
             $Buf[$o + 2] = [byte][int](($src[$s + 2] * $Brightness) / 100)
@@ -494,7 +1012,13 @@ function Set-Block {
 function Get-MatrixFrame {
     # One equal cell per session on a grid, as base64 RGB. See Get-Grid for how
     # the grid is chosen and Get-Spans for how each axis is divided.
-    param([string[]]$States, [string]$Idle = 'green', $Override = $null)
+    #
+    # $Offset is the scroll position in columns and only means anything when the
+    # override carries a scroll block. It counts UP whatever the direction is;
+    # Get-ScrollOffset turns it round for `dir: right`, so a caller only ever has
+    # to hand over a frame counter. At 0, with no scroll block, this composes
+    # exactly the frame it always did.
+    param([string[]]$States, [string]$Idle = 'green', $Override = $null, [int]$Offset = 0)
 
     $states = @($States)
     $buf = New-Object 'byte[]' ($MatrixW * $MatrixH * 3)   # zeroed == all off
@@ -523,11 +1047,22 @@ function Get-MatrixFrame {
     }
     $avail = $MatrixH - $top
 
-    # A takeover owns the panel outright, so nothing below runs.
+    # Scrolling applies to BOTH modes, so the spec is read once here. $null means
+    # a static drawing and the original blit, unchanged.
+    $scroll = Get-ScrollSpec -Ov $Override
+
+    # A takeover owns the panel outright, so nothing below runs. Scrolling, it
+    # walks the canvas across the full width.
     if ($null -ne $Override -and $Override.mode -eq 'takeover') {
-        if (Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) -H ([int]$Override.h) -X0 0 -Y0 $top) {
-            return [Convert]::ToBase64String($buf)
+        if ($null -ne $scroll) {
+            $ok = Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) -H ([int]$Override.h) `
+                -X0 0 -Y0 $top -Scroll -RegionW $MatrixW `
+                -Offset (Get-ScrollOffset -Scroll $scroll -Offset $Offset) -Gap ([int]$scroll.gap)
         }
+        else {
+            $ok = Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) -H ([int]$Override.h) -X0 0 -Y0 $top
+        }
+        if ($ok) { return [Convert]::ToBase64String($buf) }
         Write-Trace 'override: takeover pixels rejected, falling through'
     }
 
@@ -552,10 +1087,19 @@ function Get-MatrixFrame {
         $drawX0 = $parts[$sesParts][0]
         $drawX1 = $parts[$total - 1][0] + $parts[$total - 1][1] - 1
 
-        if (-not (Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) `
-                    -H ([int]$Override.h) -X0 $drawX0 -Y0 $top)) {
-            Write-Trace 'override: session pixels rejected'
+        # Scrolling here is confined to the drawing's own share of the width. The
+        # window is the share, NOT the rest of the panel: without an explicit
+        # region the walk would run on over the sessions laid out to its left.
+        if ($null -ne $scroll) {
+            $ok = Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) -H ([int]$Override.h) `
+                -X0 $drawX0 -Y0 $top -Scroll -RegionW ($drawX1 - $drawX0 + 1) `
+                -Offset (Get-ScrollOffset -Scroll $scroll -Offset $Offset) -Gap ([int]$scroll.gap)
         }
+        else {
+            $ok = Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) `
+                -H ([int]$Override.h) -X0 $drawX0 -Y0 $top
+        }
+        if (-not $ok) { Write-Trace 'override: session pixels rejected' }
 
         # Nothing running: the drawing is the whole point, so stop here rather
         # than painting an empty region beside it.
@@ -602,6 +1146,20 @@ function Set-Cube {
     # different connection from the update_leds push is rejected outright.
     param([string[]]$States, [string]$Aggregate)
 
+    # DEFER TO A LIVE ANIMATION. The animator repaints the whole panel every
+    # frame from freshly read session state, so a hook painting here would only
+    # flicker one static frame into the middle of the scroll and be overwritten
+    # milliseconds later. Freshness is the entire test: a heartbeat left behind
+    # by a killed animator is stale within seconds and stops mattering, which is
+    # why this is not a lock.
+    #
+    # $false rather than $true so Set-Light unwinds its cache claim: nothing was
+    # painted, and the next hook after the animation ends has to repaint.
+    if (-not $script:IsAnimator -and (Test-AnimatorLive)) {
+        Write-Trace 'cube: deferring, animator heartbeat is fresh'
+        return $false
+    }
+
     if ($Aggregate -eq 'off') {
         return (Send-Yeelight -Method 'set_power' -ParamsJson '["off","smooth",500]')
     }
@@ -609,38 +1167,22 @@ function Set-Cube {
     $ov = Get-Override -States $States
     $frame = Get-MatrixFrame -States $States -Idle $Aggregate -Override $ov
 
-    $client = New-Object Net.Sockets.TcpClient
+    # A scrolling override with nobody driving it would show one frozen window
+    # onto the canvas, which looks like a bug rather than a feature. Start the
+    # animator and push this frame anyway, so something is on the panel even if
+    # the spawn fails.
+    if (-not $script:IsAnimator -and $null -ne (Get-ScrollSpec -Ov $ov)) { Start-Animator }
+
+    $conn = Open-Cube
+    if ($null -eq $conn) { return $false }
     try {
-        $ar = $client.BeginConnect($CubeIp, $CubePort, $null, $null)
-        if (-not $ar.AsyncWaitHandle.WaitOne($ConnectMs)) { return $false }
-        $client.EndConnect($ar)
-        $stream = $client.GetStream()
-        $stream.ReadTimeout = 2000
-
-        $send = {
-            param([string]$Json, [bool]$Read)
-            $b = [Text.Encoding]::UTF8.GetBytes($Json + [char]13 + [char]10)
-            $stream.Write($b, 0, $b.Length)
-            $stream.Flush()
-            if (-not $Read) { return $true }
-            $rb = New-Object byte[] 1024
-            try { $n = $stream.Read($rb, 0, $rb.Length) } catch { return $false }
-            if ($n -le 0) { return $false }
-            return ([Text.Encoding]::UTF8.GetString($rb, 0, $n) -match '"result"')
-        }
-
-        [void](& $send '{"id":1,"method":"set_power","params":["on","smooth",300]}' $true)
-        if (-not (& $send '{"id":1,"method":"activate_fx_mode","params":[{"mode":"direct"}]}' $true)) {
-            Write-Trace 'cube: activate_fx_mode refused'
-            return $false
-        }
-        # update_leds never replies, so this is the last thing that can be known.
-        [void](& $send ('{"id":1,"method":"update_leds","params":["' + $frame + '"]}') $false)
+        if (-not (Initialize-CubeDirect -Conn $conn)) { return $false }
+        [void](Push-CubeFrame -Conn $conn -Frame $frame)
         Write-Trace ('cube: pushed frame for ' + @($States).Count + ' session(s)')
         return $true
     }
     catch { return $false }
-    finally { $client.Close() }
+    finally { Close-Cube $conn }
 }
 
 function Show-Status {
@@ -680,6 +1222,32 @@ function Show-Status {
 
     "aggregate : " + $pic.Aggregate
     "cache     : " + $(if (Test-Path $CacheFile) { (Get-Content $CacheFile -Raw -ErrorAction SilentlyContinue).Trim() } else { '(none)' })
+
+    # Whether an animation is running, and on what. These verbs exist so nothing
+    # else has to guess, and "the panel is moving" is not something a hook paint
+    # or the cache line can tell you: while it runs, hook paints are deferring
+    # and the cache is describing a frame nobody pushed.
+    $anim = Get-AnimatorInfo
+    if ($null -eq $anim) { "animation : not running" }
+    else { "animation : running (pid {0}, heartbeat {1:n1}s ago)" -f $anim.pid, $anim.age }
+
+    $ovScroll = Get-Override -States @($pic.Slots | ForEach-Object { $_.State })
+    $scSpec = Get-ScrollSpec -Ov $ovScroll
+    if ($null -eq $scSpec) { "scroll    : none (no override, or it holds still)" }
+    else {
+        # Both halves of the rate, because neither is the whole answer: the
+        # updates are what the device is charged for and the columns are what the
+        # eye sees, and the budget can slow the first without touching the second.
+        "scroll    : {0:n2} update/s x {1} col = {2:n1} col/s {3}, gap {4}, canvas {5}x{6} on a {7}-wide panel" -f `
+            $scSpec.speed, $scSpec.step, ($scSpec.speed * $scSpec.step), $scSpec.dir, $scSpec.gap,
+        $ovScroll.w, $ovScroll.h, $MatrixW
+        $bMs = Get-AnimateFrameBudgetMs
+        $wantMs = [int][Math]::Round(1000.0 / [double]$scSpec.speed)
+        if ($wantMs -lt $bMs) {
+            "            budget slows this to {0:n2} update/s ({1}ms): {2} cmd/min ceiling" -f `
+            (1000.0 / $bMs), $bMs, $AnimateMaxCommandsPerMinute
+        }
+    }
 
     # What the panel is being asked to render, which is not the same thing as
     # the aggregate.
@@ -1134,6 +1702,23 @@ if ($State -eq 'layout') {
         colors     = $CubeColors
         brightness = $Brightness
         override   = $(if ($null -eq $ov) { $null } else { @{ mode = $ov.mode; w = $ov.w; h = $ov.h; stamp = $ov.stamp } })
+        # The scroll block AS CLAMPED, not as written: the editor should be shown
+        # what will actually happen, not what it asked for. Bounds are included
+        # so it can range its own controls without hardcoding them here twice.
+        scroll     = $(
+            $sc = Get-ScrollSpec -Ov $ov
+            if ($null -eq $sc) { $null } else { @{ speed = $sc.speed; dir = $sc.dir; gap = $sc.gap; loop = $true } }
+        )
+        scroll_limits = @{
+            speed_min = $ScrollMinSpeed; speed_max = $ScrollMaxSpeed; speed_default = $ScrollDefaultSpeed
+            gap_min   = $ScrollMinGap; gap_max = $ScrollMaxGap; gap_default = $ScrollDefaultGap
+            dirs      = @('left', 'right')
+        }
+        # Whether the resident loop is actually driving the panel right now.
+        animating  = $(
+            $ai = Get-AnimatorInfo
+            if ($null -eq $ai) { $null } else { @{ pid = $ai.pid; heartbeat_age = [Math]::Round($ai.age, 2) } }
+        )
         dark       = Get-DarkReason
     } | ConvertTo-Json -Depth 6 -Compress
     exit 0
@@ -1170,6 +1755,342 @@ if ($State -eq 'prune') {
 }
 
 if ($State -eq 'status') { Show-Status; exit 0 }
+
+if ($State -eq 'animate') {
+    # THE RESIDENT LOOP. Everything else in this script is a short-lived process
+    # that paints once and exits; this one stays and pushes frames.
+    #
+    # It holds ONE connection for the whole run. That is not an optimisation: the
+    # firmware arms direct mode per connection, so arming on one socket and
+    # pushing on another is answered with "illegal request", and reconnecting
+    # costs about 150ms, which at any readable scroll rate is most of the frame
+    # budget. See Open-Cube.
+    $script:IsAnimator = $true
+
+    if (Test-AnimatorLive) {
+        # Two animators would push interleaved frames from independently
+        # advancing offsets, and the panel would stutter rather than scroll.
+        $other = Get-AnimatorInfo
+        "already animating (pid {0}, heartbeat {1:n1}s ago), nothing to do" -f $other.pid, $other.age
+        Write-Trace 'animate: refused, another animator is live'
+        exit 0
+    }
+    Remove-Item -LiteralPath $AnimateStopFile -Force -ErrorAction SilentlyContinue
+
+    $pic = Get-Picture
+    $states = @($pic.Slots | ForEach-Object { $_.State })
+    $ov = Get-Override -States $states
+    $scroll = Get-ScrollSpec -Ov $ov
+    if ($null -eq $scroll) {
+        "no scrolling override to animate"
+        Write-Trace 'animate: nothing to animate'
+        exit 0
+    }
+
+    "animating $($ov.mode) $($ov.w)x$($ov.h) at $($scroll.speed) update/s x $($scroll.step) col $($scroll.dir), gap $($scroll.gap)"
+    Write-Trace ("animate: start mode=$($ov.mode) canvas=$($ov.w)x$($ov.h) " +
+        "speed=$($scroll.speed) step=$($scroll.step) dir=$($scroll.dir) gap=$($scroll.gap)")
+
+    # Consecutive connect-or-arm failures, for the backoff. A device that has
+    # decided to stop answering needs to be LEFT ALONE to recover, and retrying
+    # flat out at the frame rate is the one behaviour guaranteed to keep it
+    # quiet. This is the SHORT backoff, for a socket that would not open or an
+    # arm that went unanswered; a quota refusal is a different failure with a
+    # different cure and gets $AnimateQuotaBackoffMs instead.
+    $failures = 0
+    function Get-Backoff {
+        param([int]$N)
+        $ms = 500 * [Math]::Pow(2, [Math]::Min($N, 4))   # 0.5s, 1, 2, 4, 8s and hold
+        return [int][Math]::Min($ms, 8000)
+    }
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # THE BUDGET. Every command this loop sends is stamped into this queue and
+    # Get-BudgetWaitMs holds the loop when a minute's worth is already in flight.
+    # It counts FRAMES, PROBES AND ARMS alike, because the device counts them
+    # alike: a limiter that only paced the frames would be describing a rate the
+    # device never sees.
+    $cmdTimes = New-Object 'System.Collections.Generic.Queue[double]'
+    $script:animCmdCount = 0
+    function Wait-CubeBudget {
+        # Block until there is room for one more command, then record it. Called
+        # immediately BEFORE each send, never after: recording a command that has
+        # not gone yet is the safe direction to be wrong in.
+        param([string]$What = 'command')
+        $said = $false
+        while ($true) {
+            $w = Get-BudgetWaitMs -Times $cmdTimes -NowMs $sw.Elapsed.TotalMilliseconds `
+                -PerMinute $AnimateMaxCommandsPerMinute
+            if ($w -le 0) { break }
+            if (-not $said) {
+                Write-Trace ("animate: budget full ({0}/min), holding {1}ms before {2}" -f `
+                        $AnimateMaxCommandsPerMinute, $w, $What)
+                $said = $true
+            }
+            Start-Sleep -Milliseconds ([Math]::Min($w, 1000))
+        }
+        [void]$cmdTimes.Enqueue($sw.Elapsed.TotalMilliseconds)
+        $script:animCmdCount++
+    }
+
+    # The floor the budget puts under the frame interval, and the frame interval
+    # itself. A speed the budget cannot afford is SLOWED, and said so in the
+    # trace: a ticker running slower than asked is still a ticker, and a ticker
+    # that spends the device's whole minute is a frozen panel plus a status light
+    # that can no longer paint.
+    $minFrameMs = Get-AnimateFrameBudgetMs
+    function Get-FrameMs {
+        param($Sc)
+        $want = [int][Math]::Round(1000.0 / [double]$Sc.speed)
+        if ($want -lt $minFrameMs) {
+            # The concatenation is parenthesised because -f BINDS TIGHTER THAN +:
+            # without the brackets it formats only the last literal and the {0}
+            # in the first one is printed verbatim.
+            Write-Trace (("animate: {0:n2} update/s wants {1}ms, budget allows {2}ms " +
+                    "({3} cmd/min ceiling) - slowing to the budget") -f $Sc.speed, $want, $minFrameMs,
+                $AnimateMaxCommandsPerMinute)
+            return $minFrameMs
+        }
+        return $want
+    }
+
+    $conn = $null
+    $offset = 0          # COLUMNS, and it now moves by $step rather than by one
+    $frames = 0
+    $connCmds = 0        # commands spent on the connection currently held
+    $poweredOn = $false
+    $holdUntilMs = -1.0  # quota lockout: no commands at all until the clock passes this
+    $stateAt = Get-Date
+    $exitReason = 'stopped'
+    $intervals = New-Object 'System.Collections.Generic.List[double]'
+    $lastFrameMs = -1.0
+    $nextMs = 0.0
+    $step = [int]$scroll.step
+    $frameMs = Get-FrameMs $scroll
+    $prevSpeed = [double]$scroll.speed
+    $prevStep = $step
+    Write-Trace (("animate: pacing {0}ms/update, {1} col/update, ceiling {2} cmd/min, " +
+            "probe+rotate every {3} commands") -f $frameMs, $step, $AnimateMaxCommandsPerMinute, $AnimateProbeEvery)
+
+    try {
+        while ($true) {
+            # ---- re-read the world, about once a second ----------------------
+            # Hook paints are deferring to this process, so nothing else is going
+            # to notice a session starting, finishing or turning red. The SAME
+            # functions the hook path uses are called here, which is what keeps
+            # the rules intact: yellow and red never time out, $IdleDark still
+            # applies, and Get-DarkReason still owns every reason to go out.
+            if (((Get-Date) - $stateAt).TotalSeconds -ge $AnimateStateSeconds) {
+                $stateAt = Get-Date
+
+                if (Test-Path -LiteralPath $AnimateStopFile) {
+                    Remove-Item -LiteralPath $AnimateStopFile -Force -ErrorAction SilentlyContinue
+                    $exitReason = 'asked to stop'
+                    break
+                }
+
+                $dark = Get-DarkReason
+                if ($null -ne $dark) { $exitReason = "dark ($dark)"; break }
+
+                $pic = Get-Picture
+                $states = @($pic.Slots | ForEach-Object { $_.State })
+                $ov = Get-Override -States $states
+                $scroll = Get-ScrollSpec -Ov $ov
+                if ($null -eq $scroll) { $exitReason = 'override gone, expired, or no longer scrolling'; break }
+
+                # The editor can change the speed or the step under a running
+                # animation. Recomputed only on an actual change, so the "slowing
+                # to the budget" trace is one line per change rather than one a
+                # second for as long as the ticker runs.
+                if ([double]$scroll.speed -ne $prevSpeed -or [int]$scroll.step -ne $prevStep) {
+                    $prevSpeed = [double]$scroll.speed
+                    $prevStep = [int]$scroll.step
+                    $step = $prevStep
+                    $frameMs = Get-FrameMs $scroll
+                    Write-Trace ("animate: respaced to {0}ms/update, {1} col/update" -f $frameMs, $step)
+                }
+            }
+
+            # ---- a quota lockout is served by WAITING -------------------------
+            # Nothing is sent at all while this holds, not even a probe. The cap
+            # that was hit is the client-level one and it refills on a clock (51
+            # seconds measured), so every command sent in the meantime is a
+            # command that does not land and may push the refill further out.
+            # The state re-read above still runs, so a stop request, the override
+            # going away and the panel going dark are all still noticed.
+            #
+            # The heartbeat is deliberately NOT refreshed here. It goes stale
+            # within seconds, hook paints stop deferring, and that is correct: a
+            # process that is not painting must not hold the panel.
+            if ($holdUntilMs -gt $sw.Elapsed.TotalMilliseconds) {
+                Start-Sleep -Milliseconds 250
+                continue
+            }
+            if ($holdUntilMs -ge 0) {
+                $holdUntilMs = -1.0
+                $nextMs = $sw.Elapsed.TotalMilliseconds   # resync the pacing after the wait
+                Write-Trace 'animate: quota backoff over, resuming'
+            }
+
+            # ---- connection, armed one command at a time ----------------------
+            if ($null -eq $conn) {
+                $conn = Open-Cube
+                if ($null -eq $conn) { Start-Sleep -Milliseconds (Get-Backoff $failures); $failures++; continue }
+                $connCmds = 0
+
+                # set_power on the FIRST connection only. It is there to recover a
+                # panel someone switched off in the Yeelight app, which is a
+                # start-of-run question; paying it again on every rotation would
+                # spend one frame in twenty asking a panel that is visibly being
+                # written to whether it is on.
+                if (-not $poweredOn) {
+                    Wait-CubeBudget 'set_power'
+                    [void](Send-CubeJson -Conn $conn -Json '{"id":1,"method":"set_power","params":["on","smooth",300]}' -Read $true)
+                    $connCmds++
+                    $poweredOn = $true
+                }
+
+                # Arming IS the quota probe: activate_fx_mode is the command that
+                # replies, so the arm doubles as the answer to "is this socket
+                # being served".
+                Wait-CubeBudget 'arm'
+                $armState = Test-CubeQuota -Conn $conn
+                $connCmds++
+                if ($armState -eq 'quota') {
+                    # A FRESH connection refused means the client-level cap is
+                    # spent, not this socket's. Reconnecting cannot help; only the
+                    # refill can.
+                    Write-Trace ("animate: fresh connection refused on quota, backing off {0}ms" -f $AnimateQuotaBackoffMs)
+                    Close-Cube $conn; $conn = $null
+                    $holdUntilMs = $sw.Elapsed.TotalMilliseconds + $AnimateQuotaBackoffMs
+                    continue
+                }
+                if ($armState -ne 'ok') {
+                    Close-Cube $conn; $conn = $null
+                    Start-Sleep -Milliseconds (Get-Backoff $failures)
+                    $failures++
+                    continue
+                }
+                $failures = 0
+                Write-Trace 'animate: connected and armed'
+            }
+
+            # ---- one frame ---------------------------------------------------
+            Wait-CubeBudget 'frame'
+            $frame = Get-MatrixFrame -States $states -Idle $pic.Aggregate -Override $ov -Offset $offset
+            $pushed = Push-CubeFrame -Conn $conn -Frame $frame
+            $connCmds++
+            if (-not $pushed) {
+                # A socket error is the only failure a PUSH can report, because
+                # update_leds never replies: a frame refused on quota looks
+                # exactly like a frame that landed. That is what the probe below
+                # is for, and it is why this branch is about broken sockets only.
+                Write-Trace 'animate: push failed, reconnecting'
+                Close-Cube $conn; $conn = $null
+                Start-Sleep -Milliseconds (Get-Backoff $failures)
+                $failures++
+                continue
+            }
+
+            # The heartbeat goes down AFTER a successful push, so it only ever
+            # claims the panel while frames are genuinely landing.
+            Update-AnimatorHeartbeat
+            $offset += $step
+            $frames++
+
+            # ---- probe, then retire the connection ---------------------------
+            # ONE command that actually answers, ON THE SOCKET THE FRAMES WENT
+            # DOWN. It says whether the frames just pushed were being served, and
+            # it is the only thing that can: a probe on a new socket gets a new
+            # budget and always says yes.
+            if ($connCmds -ge ($AnimateProbeEvery - 1)) {
+                Wait-CubeBudget 'probe'
+                $probe = Test-CubeQuota -Conn $conn
+                $connCmds++
+                if ($probe -eq 'quota') {
+                    # Frames pushed since the refusal began were discarded and the
+                    # panel has been frozen on the last one that landed. Nothing
+                    # can recover those; what matters is saying so, because a
+                    # frozen panel with a healthy-looking log is the exact failure
+                    # this instrument exists to end.
+                    Write-Trace (("animate: QUOTA on the pushing connection after {0} commands, " +
+                            "frames since the last probe may not have rendered") -f $connCmds)
+                }
+                elseif ($probe -ne 'ok') {
+                    Write-Trace 'animate: probe went unanswered on the pushing connection'
+                }
+                # Rotate either way. The connection has spent its budget: keeping
+                # it would mean pushing into a socket whose remaining credit is
+                # unknown and unreadable.
+                Close-Cube $conn; $conn = $null
+            }
+
+            if ($AnimateProfile) {
+                $nowMs = $sw.Elapsed.TotalMilliseconds
+                if ($lastFrameMs -ge 0) { [void]$intervals.Add($nowMs - $lastFrameMs) }
+                $lastFrameMs = $nowMs
+            }
+
+            # Paced against a stopwatch rather than by sleeping a fixed amount,
+            # because composing and pushing a frame is not free and the drift
+            # would otherwise accumulate into a visibly slow ticker.
+            $nextMs += $frameMs
+            $wait = [int]($nextMs - $sw.Elapsed.TotalMilliseconds)
+            if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+            elseif ($wait -lt -1000) { $nextMs = $sw.Elapsed.TotalMilliseconds }   # fell far behind, resync
+        }
+    }
+    catch {
+        $exitReason = 'error: ' + $_.Exception.Message
+        Write-Trace ('animate EXCEPTION line ' + $_.InvocationInfo.ScriptLineNumber + ': ' + $_.Exception.Message)
+    }
+    finally {
+        if ($null -ne $conn) { Close-Cube $conn }
+        # Released before the final paint, so that paint is an ordinary one and
+        # does not defer to a heartbeat this process has already abandoned.
+        Remove-Item -LiteralPath $AnimateFile -Force -ErrorAction SilentlyContinue
+    }
+
+    # The SUSTAINED COMMAND RATE, which is the number the device cares about and
+    # the one no earlier version of this loop could state. Frames alone would
+    # understate it by every probe and every arm.
+    $ranMin = [Math]::Max(0.0001, $sw.Elapsed.TotalMinutes)
+    $rate = $script:animCmdCount / $ranMin
+    Write-Trace (("animate: exit after $frames frame(s), $offset column(s), " +
+            "$script:animCmdCount command(s) in {0:n1}s = {1:n1} cmd/min " +
+            "(ceiling $AnimateMaxCommandsPerMinute) ($exitReason)") -f $sw.Elapsed.TotalSeconds, $rate)
+    "stopped after $frames frame(s) / $offset column(s): $exitReason"
+    "  {0} command(s) in {1:n1}s = {2:n1} cmd/min against a {3} ceiling" -f `
+        $script:animCmdCount, $sw.Elapsed.TotalSeconds, $rate, $AnimateMaxCommandsPerMinute
+
+    if ($AnimateProfile -and $intervals.Count -gt 2) {
+        # What a stutter looks like in numbers: the median sits on the frame
+        # budget while p95 and max run far past it. Even pacing keeps them close.
+        $sorted = @($intervals | Sort-Object)
+        $pick = { param($q) $sorted[[Math]::Min($sorted.Count - 1, [int][Math]::Floor($sorted.Count * $q))] }
+        $late = @($intervals | Where-Object { $_ -gt ($frameMs * 1.5) }).Count
+        $summary = ("animate timing: n={0} budget={1}ms min={2:n0} p50={3:n0} p95={4:n0} max={5:n0} late(>1.5x)={6} ({7:n1}%)" -f `
+            $intervals.Count, $frameMs, $sorted[0], (& $pick 0.5), (& $pick 0.95), $sorted[-1],
+            $late, (100.0 * $late / $intervals.Count))
+        Write-Trace $summary
+        $summary
+    }
+
+    # ONE final ordinary paint, so the panel is left showing the current picture
+    # rather than whatever frame the loop happened to stop on. The cache is
+    # dropped first: it is only ever a belief about a panel that cannot be read
+    # back, and this process has been pushing frames it never saw, so leaving it
+    # in place could skip the repaint entirely.
+    Remove-Item -LiteralPath $CacheFile -Force -ErrorAction SilentlyContinue
+    $dark = Get-DarkReason
+    if ($null -ne $dark) { Set-Light -Want 'off' -Slots $null }
+    else {
+        $pic = Get-Picture
+        Set-Light -Want $pic.Aggregate -Slots $pic.Slots
+    }
+    exit 0
+}
 
 if ($State -eq 'watchdog') {
     # Run on a schedule. Nothing else can notice the app closing or the room
