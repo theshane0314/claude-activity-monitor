@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -225,7 +226,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"frames": list_frames()})
 
         if path.startswith("/api/frames/"):
-            name = path[len("/api/frames/"):]
+            # Names may contain spaces, so they arrive percent-encoded. Without
+            # decoding, "20 clyde" arrives as "20%20clyde" and is rejected by the
+            # name check as if it were an illegal name.
+            name = urllib.parse.unquote(path[len("/api/frames/"):])
             try:
                 with open(frame_path(name), encoding="utf-8") as fh:
                     return self.send_json(json.load(fh))
@@ -303,7 +307,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/frames/"):
             try:
-                os.remove(frame_path(path[len("/api/frames/"):]))
+                os.remove(frame_path(urllib.parse.unquote(path[len("/api/frames/"):])))
             except ValueError as e:
                 return self.send_json({"error": str(e)}, 400)
             except OSError:
