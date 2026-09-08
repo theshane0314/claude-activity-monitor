@@ -121,7 +121,9 @@
 </div>
 
 <script>
-const API = location.origin;
+// Works both at http://<pc>:8787/ and behind the tunnel at
+// https://ha.plaincandle.dev/clyde/, where every request keeps the /clyde prefix.
+const API = location.origin + location.pathname.replace(/\/[^/]*$/, '');
 let W = 20, H = 5, mode = 'session', px = [], tool = 'paint';
 let layout = null, painting = false;
 

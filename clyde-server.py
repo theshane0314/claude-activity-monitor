@@ -63,6 +63,17 @@ _layout_cache = {"at": 0.0, "value": None}
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9 _.-]{1,64}$")
 
+# Cloudflare Tunnel routes ha.plaincandle.dev/clyde/* here and does NOT strip the
+# prefix, so every path arrives with it attached. Stripping it here means the
+# editor works identically at http://<pc>:8787/ and at https://ha.../clyde/.
+URL_PREFIX = os.environ.get("CLYDE_PREFIX", "/clyde")
+
+
+def strip_prefix(path):
+    if URL_PREFIX and (path == URL_PREFIX or path.startswith(URL_PREFIX + "/")):
+        path = path[len(URL_PREFIX):] or "/"
+    return path
+
 
 def log(msg):
     """Never write to stderr.
@@ -175,7 +186,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({}, 204)
 
     def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
+        path = strip_prefix(self.path.split("?")[0]).rstrip("/") or "/"
 
         if path == "/":
             try:
@@ -221,7 +232,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
+        path = strip_prefix(self.path.split("?")[0]).rstrip("/") or "/"
         try:
             body = self.read_json()
         except Exception as e:
@@ -249,7 +260,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json({"error": "not found"}, 404)
 
     def do_DELETE(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
+        path = strip_prefix(self.path.split("?")[0]).rstrip("/") or "/"
 
         if path == "/api/override":
             try:
