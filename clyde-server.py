@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +44,10 @@ STATUS_LIGHT = os.path.join(HERE, "status-light.ps1")
 EDITOR_HTML = os.path.join(HERE, "editor.html")
 FRAMES_DIR = os.path.join(HERE, "frames")
 OVERRIDE_FILE = os.path.join(os.environ.get("TEMP", "."), "claude-status-light.override")
+
+# clyde-nas on the NAS shows this when the PC stops driving the cube. It is a
+# FULL PANEL frame: the NAS has no sessions to share the panel with.
+NAS_URL = os.environ.get("CLYDE_NAS_URL", "http://192.168.0.3:8788")
 HEARTBEAT_FILE = os.path.join(os.environ.get("TEMP", "."), "claude-status-light.state")
 
 PORT = int(os.environ.get("CLYDE_PORT", "8787"))
@@ -240,6 +245,32 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/override":
             return self.set_override(body)
+
+        if path == "/api/away-frame":
+            # Forwarded rather than sent from the browser: the editor may be
+            # loaded over https through the tunnel, and a direct call to the
+            # NAS's http endpoint would be blocked as mixed content.
+            try:
+                w, h = int(body["w"]), int(body["h"])
+                pixels = body["pixels"]
+                if (w, h) != (20, 5):
+                    return self.send_json({
+                        "error": "the away frame is the whole panel, so it must be 20x5",
+                        "got": {"w": w, "h": h}}, 400)
+                if len(pixels) != w * h:
+                    raise ValueError(f"expected {w*h} pixels, got {len(pixels)}")
+            except (KeyError, ValueError, TypeError) as e:
+                return self.send_json({"error": str(e)}, 400)
+            try:
+                req = urllib.request.Request(
+                    NAS_URL + "/away-frame",
+                    json.dumps({"w": w, "h": h, "pixels": pixels}).encode(),
+                    {"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    json.load(r)
+                return self.send_json({"ok": True})
+            except Exception as e:
+                return self.send_json({"error": f"NAS did not accept it: {e}"}, 502)
 
         if path == "/api/frames":
             try:

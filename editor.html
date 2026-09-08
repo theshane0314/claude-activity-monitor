@@ -108,6 +108,9 @@
     <button id="send" class="on" style="flex:1">Show on cube</button>
     <button id="revert" class="danger">Hand back to Claude</button>
   </div>
+  <div class="row">
+    <button id="away" title="Shown by the NAS when this PC is asleep">Use as away frame</button>
+  </div>
   <div class="msg" id="msg"></div>
 </div>
 
@@ -312,6 +315,25 @@ async function loadFrames() {
     }
   } catch (e) { box.innerHTML = '<small style="color:var(--bad)">could not list frames</small>'; }
 }
+
+// The away frame is the whole panel: when the PC is asleep there are no
+// sessions to share it with. Drawn at any other size, it is refused rather than
+// stretched.
+$('away').onclick = async () => {
+  if (W !== 20 || H !== 5) {
+    say(`the away frame is the whole panel (20x5); switch to "Whole panel" and redraw`, 'err');
+    return;
+  }
+  try {
+    const r = await fetch(API + '/api/away-frame', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ w: W, h: H, pixels: px })
+    });
+    const d = await r.json();
+    say(r.ok ? 'saved as the away frame; the NAS shows this when the PC sleeps'
+             : d.error, r.ok ? 'ok' : 'err');
+  } catch (e) { say('failed: ' + e, 'err'); }
+};
 
 $('save').onclick = async () => {
   const name = $('fname').value.trim();
