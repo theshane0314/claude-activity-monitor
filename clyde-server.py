@@ -20,7 +20,8 @@ size and the two cannot drift apart. The same goes for the scroll limits: they
 are reported by /api/layout so the editor never has to invent a maximum width.
 
     GET    /                     the editor
-    GET    /api/layout           panel, sessions, canvas size per mode, scroll limits
+    GET    /api/layout           panel, sessions, canvas size per mode, scroll limits,
+                                 and the animation shape each mode implies
     POST   /api/override         {mode, w, h, pixels[], scroll?}  -> show it
     DELETE /api/override         clear it
     GET    /api/frames           list saved frames
@@ -104,7 +105,19 @@ MAX_SCROLL_W = 256
 # spacing), so the message walks across a character at a time. It is a
 # flip-board rather than a glide, and it is the most this device can sustain.
 SCROLL_DEFAULTS = {"speed": 0.7, "step": 4, "dir": "left", "gap": 8, "loop": True}
-SCROLL_LIMITS = {"speed": [0.05, 1.0], "step": [1, 8], "gap": [0, 64],
+
+# The step ceiling is the WIDTH OF THE REGION the drawing is painted into, not a
+# number typed in here: 20 for a takeover, the share width for a session
+# override. That is what makes a SHORT ANIMATION the same mechanism as a scroll
+# (contract addendum 2): a canvas of N region widths, gap 0, stepped one whole
+# region per update, shows frame 1, then frame 2, and wraps. No frames array and
+# no second code path, so pinning, the budget limiter and the animator all apply
+# unchanged. step_ceiling() computes it from the live layout; the number below is
+# only the fallback for the paths that do not know a mode yet (a saved frame is
+# region-agnostic) and for the limit advertised by /api/layout. A region is never
+# wider than the panel, so the panel width is the honest fallback.
+STEP_CEILING_FALLBACK = 20
+SCROLL_LIMITS = {"speed": [0.05, 1.0], "step": [1, STEP_CEILING_FALLBACK], "gap": [0, 64],
                  "dir": ["left", "right"]}
 # Carried into the clamp note so whoever reads it learns WHY, not just what.
 # Without this, the obvious "fix" for a clamped speed is to raise the limit,
@@ -112,6 +125,12 @@ SCROLL_LIMITS = {"speed": [0.05, 1.0], "step": [1, 8], "gap": [0, 64],
 SPEED_REASON = ("the cube refuses commands past about 68 a minute and never says "
                 "so, so a higher speed does not scroll faster, it freezes the "
                 "panel; raise scroll.step instead to move more columns per update")
+# Attached to a clamped step for the same reason: the obvious reading of "step 40
+# was clamped to 20" is that the limit is arbitrary, when in fact a step of one
+# whole region is already the largest move that still SHOWS every frame.
+STEP_REASON = ("a step of one whole region width is already a new frame every "
+               "update, which is an animation; anything larger would skip frames "
+               "nobody would ever see")
 
 _layout_lock = threading.Lock()
 _layout_cache = {"at": 0.0, "value": None}
@@ -217,6 +236,43 @@ def get_layout(force=False):
         return value
 
 
+def step_ceiling(region_w=None):
+    """The largest step that means anything: one whole region per update.
+
+    Taken from the region the drawing is actually painted into, because a
+    session-mode animation steps by ITS share of the panel and not by the
+    panel. set_override already computes that width to validate the canvas
+    size, so it passes the value it has rather than re-deriving one.
+
+    region_w is None only where there is no mode to ask about (a saved frame,
+    and the static limit /api/layout advertises), and those fall back to the
+    widest region there is.
+    """
+    lo, hi = SCROLL_LIMITS["step"]
+    if region_w:
+        return max(lo, int(region_w))
+    return hi
+
+
+def widest_region(default=STEP_CEILING_FALLBACK):
+    """Widest region a drawing could later be shown in, for the frames path.
+
+    A saved frame has no mode, so the only honest ceiling for its step is the
+    biggest region that exists, which is the takeover canvas. Read from the
+    live layout (cached, so usually free) so this cannot drift from what
+    status-light.ps1 reports. A frame saved with a bigger step than the region
+    it is eventually shown in is clamped then, with a note, which is the same
+    thing that happens to a frame saved before this feature existed.
+    """
+    try:
+        cells = (get_layout() or {}).get("canvas") or {}
+        widths = [int(c["w"]) for c in cells.values()
+                  if isinstance(c, dict) and c.get("w")]
+        return max(widths) if widths else default
+    except (TypeError, ValueError):
+        return default
+
+
 class ScrollError(ValueError):
     """A scroll block that cannot be repaired by clamping.
 
@@ -226,7 +282,7 @@ class ScrollError(ValueError):
     """
 
 
-def parse_scroll(raw):
+def parse_scroll(raw, region_w=None):
     """Validate a `scroll` block. Returns (scroll|None, [notes]).
 
     None means "not a scrolling drawing", and the caller must then write an
@@ -241,6 +297,11 @@ def parse_scroll(raw):
     TYPES and unknown keys are refused, because those have no obvious intent:
     a typo like `spede` would otherwise silently take the default and the
     drawing would scroll at a speed nobody asked for.
+
+    region_w is the width of the region the drawing will be painted into, and
+    it is the ceiling for `step`: a step of one whole region is a new frame
+    every update, which is how a short animation is expressed without any new
+    mechanism. Callers that know it pass it; the rest get the widest region.
     """
     if raw is None or raw is False:
         return None, []
@@ -254,29 +315,42 @@ def parse_scroll(raw):
                           % (", ".join(sorted(unknown)), ", ".join(sorted(SCROLL_DEFAULTS))))
 
     notes = []
+    step_max = step_ceiling(region_w)
 
-    def number(key):
+    def number(key, hi=None):
         v = raw.get(key, SCROLL_DEFAULTS[key])
         # bool is an int in Python, and `"speed": true` is nonsense, not 1.
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             raise ScrollError(f"scroll.{key} must be a number, got {v!r}")
-        lo, hi = SCROLL_LIMITS[key]
-        if v < lo or v > hi:
-            # The speed clamp gets its reason attached, because it is the one
-            # limit a reader would otherwise assume was somebody's taste.
-            why = ("; " + SPEED_REASON) if key == "speed" else ""
-            notes.append(f"scroll.{key} {v} clamped to {lo}..{hi}{why}")
-            v = max(lo, min(hi, v))
+        lo, limit = SCROLL_LIMITS[key]
+        # step's ceiling is the region, so it is handed in rather than looked up.
+        if hi is not None:
+            limit = hi
+        if v < lo or v > limit:
+            # The speed and step clamps carry their reason, because both are
+            # limits a reader would otherwise assume were somebody's taste.
+            why = ""
+            if key == "speed":
+                why = "; " + SPEED_REASON
+            elif key == "step":
+                why = "; " + STEP_REASON
+            notes.append(f"scroll.{key} {v} clamped to {lo}..{limit}{why}")
+            v = max(lo, min(limit, v))
         return v
 
     # speed is a FLOAT at every value, never normalised back to an int. Old
     # clients and frames saved before the measurement still send `"speed": 12`,
     # and that has to land on 1.0 with a note rather than being honoured.
     speed = round(float(number("speed")), 3)
-    step = number("step")
+    step = number("step", hi=step_max)
     if not float(step).is_integer():
         notes.append(f"scroll.step {step} rounded to whole columns")
     step = int(round(step))
+    # GAP 0 MUST SURVIVE AS 0. An animation has no blank columns between its
+    # frames, so `"gap": 0` is the normal case for one, not a missing value.
+    # number() reads it with raw.get(key, DEFAULT), which only substitutes when
+    # the key is ABSENT. Never rewrite that as `raw.get(key) or DEFAULT`: a
+    # falsy 0 would silently become 8 and every frame would smear into the next.
     gap = number("gap")
     if not float(gap).is_integer():
         notes.append(f"scroll.gap {gap} rounded to whole columns")
@@ -442,6 +516,29 @@ def list_frames():
     return out
 
 
+def animation_shape(region_w, frame_widths=False):
+    """How an animation would be shaped in a region this wide.
+
+    Reported so the editor never has to derive it and end up with a different
+    answer from the one parse_scroll enforces. It describes the SAME scroll,
+    it does not introduce an animation mode: a canvas of `frames` region
+    widths with gap 0 and step = region_w replaces the picture once per
+    update, which is what an animation is here.
+    """
+    region_w = int(region_w)
+    shape = {
+        "region_w": region_w,
+        "step_max": step_ceiling(region_w),
+        "frames_max": max(1, MAX_SCROLL_W // region_w),
+    }
+    if frame_widths:
+        # The canvas width for each whole frame count, so "I want 4 frames" is a
+        # lookup rather than a multiplication the editor could round differently.
+        shape["frame_widths"] = {str(n): n * region_w
+                                 for n in range(1, shape["frames_max"] + 1)}
+    return shape
+
+
 def layout_with_scroll(force=False):
     """The PowerShell layout, plus everything the editor needs about scrolling.
 
@@ -464,20 +561,55 @@ def layout_with_scroll(force=False):
         if isinstance(cell, dict) and cell.get("w"):
             cell["scroll_min_w"] = int(cell["w"])
             cell["scroll_max_w"] = MAX_SCROLL_W
+            cell.update(animation_shape(int(cell["w"]), frame_widths=True))
         canvas[mode] = cell
     layout["canvas"] = canvas
+
+    # A session override picks a SPLIT, and its region is the share width, not
+    # the session canvas. Annotated here too or the editor would have to work
+    # out the step ceiling for a split by itself and could get a different
+    # answer from the one this server enforces. Copied first: the cache hands
+    # the same list to every caller.
+    splits = []
+    for sp in (layout.get("splits") or []):
+        sp = dict(sp) if isinstance(sp, dict) else sp
+        if isinstance(sp, dict) and sp.get("w"):
+            sp.update(animation_shape(int(sp["w"])))
+        splits.append(sp)
+    if splits:
+        layout["splits"] = splits
 
     layout["scroll"] = {
         "max_w": MAX_SCROLL_W,
         "defaults": dict(SCROLL_DEFAULTS),
         "limits": dict(SCROLL_LIMITS),
         "note": "canvas may be wider than the region it scrolls across, up to max_w",
+        # There is no "animation mode" to switch into, and adding one to the API
+        # would be inventing a second concept for a thing that is already a
+        # scroll. This says how to SHAPE a scroll so it reads as an animation.
+        "animation_note": (
+            "an animation is this same scroll, shaped: canvas w = frames * region "
+            "width, gap 0, step = region width. each update advances exactly one "
+            "whole frame and the canvas wraps, so frames = w / region width. see "
+            "canvas[mode].region_w / step_max / frames_max, and the same three "
+            "keys on each split, for the region that mode actually paints into"),
+        "frame_rate_note": (
+            "speed is frames per second for an animation, and its ceiling of 1.0 "
+            "is the hardware: a 10 frame loop takes 10 seconds. this is a "
+            "slideshow, not motion, and the device cannot do better"),
         # The editor shows this next to the speed control. speed is UPDATES per
         # second and step is COLUMNS per update, so motion is speed * step
         # columns a second, and only step can be raised without freezing it.
         "speed_note": SPEED_REASON,
-        "step_note": ("columns moved per update; at speed 1.0 a step of 4 advances "
-                      "exactly one character (3 wide plus 1 of spacing)"),
+        "step_note": (
+            "columns moved per update, 1 up to the width of the region this mode "
+            "paints into. at speed 1.0 a step of 4 advances exactly one character "
+            "(3 wide plus 1 of spacing), so the message walks across a character a "
+            "second. a step of one WHOLE region width replaces the picture every "
+            "update instead of sliding it, which is an animation: at the 1.0 "
+            "updates a second ceiling that is one frame per second, and that is "
+            "the hardware's ceiling, not a setting. the limits block advertises "
+            "the panel-wide ceiling; the real one per mode is canvas[mode].step_max"),
     }
     layout["animation"] = dict(animator_status(), scroll=scroll_report())
     return layout
@@ -633,7 +765,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(f"expected {w*h} pixels, got {len(pixels)}")
                 if w > MAX_SCROLL_W:
                     raise ValueError(f"canvas may be at most {MAX_SCROLL_W} columns wide, got {w}")
-                scroll, notes = parse_scroll(body.get("scroll"))
+                # A saved frame has no mode, so its step is clamped against the
+                # widest region there is. That lets a full-region animation step
+                # (20 for the panel) survive a save and load, instead of being
+                # cut to 8 on the way to disk and replaying as a smear.
+                scroll, notes = parse_scroll(body.get("scroll"),
+                                             region_w=widest_region())
             except ScrollError as e:
                 # Same shape the override path refuses with, so an editor that
                 # saves a frame learns the current limits from the same place
@@ -704,6 +841,10 @@ class Handler(BaseHTTPRequestHandler):
 
         # Checked before the layout call, because a bad scroll block is cheap to
         # spot and there is no point spending a PowerShell start to reject it.
+        # This pass knows no region yet, so it settles every REFUSAL and none of
+        # the clamping; it is re-run below once the region width is known. Only
+        # ranges depend on the region, and a clamp is a note, never an error, so
+        # nothing that passes here can fail there.
         try:
             scroll, notes = parse_scroll(body.get("scroll"))
         except ScrollError as e:
@@ -743,6 +884,13 @@ class Handler(BaseHTTPRequestHandler):
                     "available": [f'{s["share"]}/{s["total"]}' for s in layout.get("splits", [])],
                 }, 400)
 
+        exp_w, exp_h = int(want["w"]), int(want["h"])
+        # NOW the region is known, so step can be clamped to it rather than to a
+        # constant: a takeover steps by the panel, a session override by its own
+        # share. This is the whole of "an animation is a scroll whose step is the
+        # width of the region", and it is why the parse happens twice.
+        scroll, notes = parse_scroll(body.get("scroll"), region_w=exp_w)
+
         try:
             w, h = int(body["w"]), int(body["h"])
             pixels = body["pixels"]
@@ -750,7 +898,6 @@ class Handler(BaseHTTPRequestHandler):
         except (KeyError, ValueError, TypeError) as e:
             return self.send_json({"error": f"bad pixels: {e}"}, 400)
 
-        exp_w, exp_h = int(want["w"]), int(want["h"])
         # The height is the region's height either way: a ticker scrolls
         # sideways, so there is no reason for it to be the wrong shape
         # vertically. Only the WIDTH is allowed to grow, and only when scrolling.

@@ -126,6 +126,29 @@
   .tag.stuck { color: var(--accent); border-color: #4a3a24; }
   .tag.live { color: var(--ok); border-color: #1e4230; }
   .none { color: var(--dim); font-size: 11px; }
+
+  /* Animation authoring. The strip is one canvas of N panel-widths, so the only
+     thing separating a frame from its neighbour is where the eye is told the
+     boundary is. Hence: a divider drawn in the grid gap, the frames that are not
+     being edited dimmed, and a row of thumbnails that says which is which.
+     Deliberately NOT a third scroll region: the chips wrap, and the strip
+     scrolls in #gridwrap, which already exists. */
+  .animbar { margin-bottom: 9px; }
+  .chips { display: flex; gap: 5px; flex-wrap: wrap; }
+  .chip {
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    padding: 4px 5px; border-radius: 7px; background: #262b34;
+    border: 1px solid var(--line); cursor: pointer; line-height: 1;
+  }
+  .chip:hover { border-color: #444c5a; }
+  .chip.sel { border-color: var(--accent); background: #2a2119; }
+  .chip canvas { display: block; border-radius: 2px; background: #0c0e11; }
+  .chip b {
+    font-size: 10px; font-weight: 600; color: var(--dim); letter-spacing: .04em;
+  }
+  .chip.sel b { color: var(--accent); }
+  #grid div.fb { box-shadow: inset 0 0 0 1px #ffffff08, -2px 0 0 0 #6b5122; }
+  #grid div.off { opacity: .28; }
 </style>
 
 <h1>ClydeCube</h1>
@@ -155,6 +178,21 @@
 </div>
 
 <div class="card">
+  <div class="animbar" id="animBar" style="display:none">
+    <div class="row">
+      <label>Frame</label>
+      <div class="chips" id="frameChips"></div>
+    </div>
+    <div class="row">
+      <button id="fAdd" title="A blank frame after this one">Add</button>
+      <button id="fDup" title="Copy this frame and edit the copy: the fastest way to build an animation">Duplicate</button>
+      <button id="fLeft" title="Swap with the frame before it">Move left</button>
+      <button id="fRight" title="Swap with the frame after it">Move right</button>
+      <button id="fWipe" title="Blank this frame, keeping it in the loop">Clear frame</button>
+      <button id="fDel" class="danger" title="Remove this frame from the loop">Delete</button>
+    </div>
+    <div class="row"><span class="hint" id="animHelp"></span></div>
+  </div>
   <div id="gridwrap"><div id="grid"></div></div>
   <div class="row" style="margin-top:10px">
     <input type="color" id="colour" value="#ff7000">
@@ -178,30 +216,43 @@
 
 <div class="card">
   <div class="row">
+    <label>Authoring</label>
+    <button id="aScroll" class="on" title="One wide drawing that walks past the panel">Scrolling ticker</button>
+    <button id="aAnim" title="A run of panel-sized frames, shown one after another">Animation</button>
+  </div>
+  <div class="row" id="rowWidth">
     <label>Canvas width</label>
     <input type="range" id="cw" min="20" max="120" step="1" value="20"
            title="Draw wider than the panel and the panel becomes a window onto it">
     <span class="pill" id="cwVal">20 cols</span>
     <button id="cwReset" title="Back to exactly the panel width">Fit panel</button>
   </div>
+  <div class="row" id="rowFrames" style="display:none">
+    <label>Frames</label>
+    <button id="fMinus" title="One frame fewer, taken off the end">&minus;</button>
+    <input type="number" id="fcount" min="1" max="12" step="1" value="4" title="How many frames the loop has">
+    <button id="fPlus" title="One more frame on the end">+</button>
+    <span class="pill" id="fcVal"></span>
+  </div>
   <div class="row">
-    <label>Ticker</label>
+    <label id="lblTicker">Ticker</label>
     <button id="scrollOn">Scroll</button>
-    <label>Speed</label>
+    <label id="lblSpeed">Speed</label>
     <span class="pair">
       <input type="number" id="spd" min="0.05" max="1" step="0.05" value="0.7" title="Updates per second">
-      <span class="pill">updates/sec</span>
+      <span class="pill" id="spdUnit">updates/sec</span>
     </span>
-    <label>Step</label>
-    <span class="pair">
+    <label id="lblStep">Step</label>
+    <span class="pair" id="stepPair">
       <input type="number" id="stp" min="1" max="8" step="1" value="4" title="Columns moved on each update; 4 is one character">
       <span class="pill">cols/update</span>
     </span>
+    <span class="pill" id="animStep" style="display:none"></span>
   </div>
   <div class="row">
     <div class="hint" id="capNote"></div>
   </div>
-  <div class="row">
+  <div class="row" id="rowDir">
     <label>Direction</label>
     <button id="dirL" class="on">Left</button>
     <button id="dirR">Right</button>
@@ -211,7 +262,7 @@
       <span class="pill">blank cols</span>
     </span>
   </div>
-  <div class="row"><label>Preview</label><span class="pill" id="pvInfo"></span></div>
+  <div class="row"><label>Preview</label><span class="pill" id="pvInfo"></span><span class="pill" id="pvNow" style="display:none"></span></div>
   <div class="row"><span class="hint" id="pvDetail"></span></div>
   <canvas id="pvWin" class="pv"></canvas>
   <canvas id="pvStrip" class="pv"></canvas>
@@ -240,6 +291,14 @@ let layout = null, painting = false;
 let regionW = 20, maxW = 120;
 let scrollOn = false, scrollDir = 'left';
 
+// AN ANIMATION IS A SCROLL WHOSE STEP IS THE WIDTH OF THE REGION. A canvas of N
+// panel-widths, stepped a whole panel per update with gap 0, shows frame 1, then
+// frame 2, and wraps back to frame 1. There is no second format and no second
+// player: animation mode is the ordinary scrolling override with its width, step
+// and gap locked so they cannot be set wrong by hand. What it adds is the part
+// that was missing, which is a way to DRAW frame 3 without counting columns.
+let animMode = false, curFrame = 0;
+
 const $ = id => document.getElementById(id);
 const hex2rgb = h => [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
 const rgb2hex = c => '#' + c.map(v => v.toString(16).padStart(2,'0')).join('');
@@ -251,12 +310,19 @@ function say(t, cls='') { const m = $('msg'); m.textContent = t; m.className = '
 
 // Cell size comes from whichever runs out first, the viewport height or the
 // width on offer, with a floor so a wide canvas stays drawable with a finger.
+let cellPx = 16;
 function sizeGrid() {
   const wrap = $('gridwrap');
   const avail = Math.max(120, wrap.clientWidth) - 12;
   const byH = (window.innerHeight * 0.30) / H;
-  const byW = (avail - 2 * (W - 1)) / W;
+  // In animation mode the width on offer belongs to ONE FRAME, not to the whole
+  // strip: a 12 frame animation sized to fit 240 columns on screen would give
+  // cells nobody can hit with a finger. The rest of the strip scrolls in
+  // #gridwrap, which is the scroll region this view already has.
+  const cols = animMode ? regionW : W;
+  const byW = (avail - 2 * (cols - 1)) / cols;
   const cell = clamp(Math.min(byH, byW), 11, 56);
+  cellPx = cell;
   const g = $('grid');
   g.style.gridTemplateColumns = `repeat(${W}, ${cell.toFixed(2)}px)`;
   g.style.gridAutoRows = cell.toFixed(2) + 'px';
@@ -272,6 +338,8 @@ function buildGrid() {
   }
   sizeGrid();
   paintAll();
+  applyFrameMask();
+  buildChips();
   $('canvasSize').textContent = W > regionW
     ? `${W} x ${H}, window ${regionW}` : `${W} x ${H}`;
   syncScrollUI();
@@ -280,7 +348,7 @@ function buildGrid() {
 function paintAll() {
   const kids = $('grid').children;
   for (let i = 0; i < px.length; i++) kids[i].style.background = rgb2hex(px[i]);
-  pvDirty = true;
+  pvDirty = true; thumbDirty = true;
 }
 
 function resize(w, h) {
@@ -306,7 +374,13 @@ function apply(i) {
   }
   px[i] = tool === 'erase' ? [0,0,0] : hex2rgb($('colour').value);
   $('grid').children[i].style.background = rgb2hex(px[i]);
-  pvDirty = true;
+  pvDirty = true; thumbDirty = true;
+  // Drawing into a dimmed frame is drawing into a frame you are not editing, so
+  // the selection follows the pen rather than quietly discarding the stroke.
+  if (animMode) {
+    const f = Math.floor((i % W) / regionW);
+    if (f !== curFrame) selectFrame(f, true);
+  }
 }
 
 // Pointer events so it works with a mouse and with a finger on the HA app.
@@ -327,6 +401,288 @@ $('fill').onclick = () => { const c = hex2rgb($('colour').value); px = px.map(()
 $('clear').onclick = () => { px = px.map(() => [0,0,0]); paintAll(); };
 $('erase').onclick = e => { tool = tool === 'erase' ? 'paint' : 'erase'; e.target.classList.toggle('on', tool === 'erase'); $('pick').classList.remove('on'); };
 $('pick').onclick = e => { tool = tool === 'pick' ? 'paint' : 'pick'; e.target.classList.toggle('on', tool === 'pick'); $('erase').classList.remove('on'); };
+
+// ---- animation frames ----------------------------------------------------
+
+// The canvas is one strip of N blocks of regionW columns. Every frame operation
+// is therefore a column-block operation on `px`, and nothing about the format
+// changes: what gets sent is still a wide canvas with a scroll on it.
+let thumbDirty = true;
+let chipCv = [];
+
+const frameCount = () => animMode ? Math.max(1, Math.round(W / regionW)) : 1;
+
+// The region this mode actually paints into, as the server describes it. A newer
+// clyde-server annotates the takeover canvas and every split with frames_max and
+// step_max, so the editor asks rather than deriving a second answer that could
+// differ from the one the server enforces.
+function regionCell() {
+  if (!layout) return null;
+  return mode === 'takeover' ? (layout.canvas || {}).takeover : currentSplit();
+}
+// 256 is the canvas ceiling (layout.scroll.max_w), so the fallback frame ceiling
+// is however many panel-widths fit inside it.
+const maxFrames = () => {
+  const c = regionCell(), n = c && Number(c.frames_max);
+  if (Number.isFinite(n) && n >= 1) return clamp(Math.floor(n), 1, 64);
+  return clamp(Math.floor(Math.min(maxW, 256) / regionW), 1, 64);
+};
+// The largest step this server will accept for this region. An older build caps
+// it at 8 columns, which is not enough to advance a whole frame.
+const stepCeiling = () => {
+  const c = regionCell(), n = c && Number(c.step_max);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : LIM.stepMax;
+};
+
+// Cut the strip into per-frame blocks. `rw` is passed in rather than read from
+// regionW, because reflowing after a panel-slice change needs the OLD width.
+function sliceFrames(rw, w, data) {
+  const n = Math.max(1, Math.ceil(w / rw)), out = [];
+  for (let i = 0; i < n; i++) {
+    const f = [];
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < rw; x++) {
+        const sx = i * rw + x;
+        f.push(sx < w ? [...(data[y * w + sx] || [0,0,0])] : [0,0,0]);
+      }
+    out.push(f);
+  }
+  return out;
+}
+
+// Lay a list of frames back out as the canvas. This is the ONLY thing that sets
+// W in animation mode, which is what keeps width locked to frames * regionW.
+function writeFrames(list, rw) {
+  const n = Math.max(1, list.length), nw = n * rw;
+  const out = Array.from({length: nw * H}, () => [0,0,0]);
+  list.forEach((f, i) => {
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < rw; x++) out[y * nw + i * rw + x] = f[y * rw + x] || [0,0,0];
+  });
+  W = nw; px = out;
+  curFrame = clamp(curFrame, 0, n - 1);
+  buildGrid();
+}
+
+const blankFrame = rw => Array.from({length: rw * H}, () => [0,0,0]);
+const currentFrames = () => sliceFrames(regionW, W, px);
+
+// A frame drawn at one panel slice, shown at another: crop or pad rather than
+// stretch, so the drawing that survives is the drawing that was made.
+function reflowFrame(f, ow, nw) {
+  const out = [];
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < nw; x++) out.push(x < ow ? (f[y * ow + x] || [0,0,0]) : [0,0,0]);
+  return out;
+}
+
+function setFrames(list, msg) {
+  const cap = maxFrames();
+  let trimmed = false;
+  if (list.length > cap) { list = list.slice(0, cap); trimmed = true; }
+  writeFrames(list, regionW);
+  frameIntoView();
+  if (trimmed) say(`kept ${cap} frames, which is all a ${regionW}-wide panel fits in the 256 column canvas`, 'err');
+  else if (msg) say(msg, 'ok');
+}
+
+function selectFrame(i, noScroll) {
+  const n = frameCount();
+  curFrame = ((i % n) + n) % n;
+  applyFrameMask();
+  markChips();
+  syncScrollUI();
+  if (!noScroll) frameIntoView();
+}
+
+// The grid is one long strip, so the frame being edited is named by dimming the
+// others and drawing a divider in the gap column at every boundary.
+function applyFrameMask() {
+  const kids = $('grid').children;
+  for (let i = 0; i < kids.length; i++) {
+    const x = i % W, el = kids[i];
+    el.classList.toggle('fb', animMode && x % regionW === 0 && x !== 0);
+    el.classList.toggle('off', animMode && Math.floor(x / regionW) !== curFrame);
+  }
+}
+
+function frameIntoView() {
+  if (!animMode) return;
+  const wrap = $('gridwrap'), pitch = cellPx + 2;
+  const left = curFrame * regionW * pitch;
+  const want = left - Math.max(0, (wrap.clientWidth - regionW * pitch) / 2);
+  // Assigned, not scrollTo({behavior:'smooth'}): the smooth request was measured
+  // in the browser doing nothing at all here (scrollLeft stayed put, so drawing
+  // landed in the frame that was still on screen rather than the one selected),
+  // while a plain assignment moves it every time.
+  wrap.scrollLeft = Math.max(0, want);
+}
+
+const thumbCell = () => clamp(Math.round(90 / regionW), 2, 8);
+
+function drawThumb(i) {
+  const cv = chipCv[i];
+  if (!cv) return;
+  const t = thumbCell();
+  const ctx = fitCanvas(cv, regionW * t, H * t);
+  ctx.fillStyle = '#0c0e11';
+  ctx.fillRect(0, 0, regionW * t, H * t);
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < regionW; x++) {
+      const c = px[y * W + i * regionW + x] || [0,0,0];
+      if (!c[0] && !c[1] && !c[2]) continue;
+      ctx.fillStyle = rgb2hex(c);
+      ctx.fillRect(x * t, y * t, t, t);
+    }
+}
+
+// Chips WRAP rather than scroll. A frame picker with a scrollbar of its own
+// would be the third scroll region on this page, and the cap is a dozen frames
+// on a full panel, so they fit.
+function buildChips() {
+  const box = $('frameChips');
+  if (!box) return;
+  if (!animMode) { box.innerHTML = ''; chipCv = []; return; }
+  const n = frameCount();
+  box.innerHTML = ''; chipCv = [];
+  for (let i = 0; i < n; i++) {
+    const b = document.createElement('div');
+    b.className = 'chip' + (i === curFrame ? ' sel' : '');
+    b.title = `Edit frame ${i + 1}`;
+    const cv = document.createElement('canvas');
+    const lb = document.createElement('b');
+    lb.textContent = i + 1;
+    b.append(cv, lb);
+    b.onclick = () => selectFrame(i);
+    box.appendChild(b);
+    chipCv.push(cv);
+  }
+  for (let i = 0; i < n; i++) drawThumb(i);
+}
+
+function markChips() {
+  const kids = $('frameChips').children;
+  for (let i = 0; i < kids.length; i++) kids[i].classList.toggle('sel', i === curFrame);
+}
+
+$('fAdd').onclick = () => {
+  const l = currentFrames();
+  l.splice(curFrame + 1, 0, blankFrame(regionW));
+  curFrame += 1;
+  setFrames(l, `added frame ${curFrame + 1}`);
+};
+$('fDup').onclick = () => {
+  const l = currentFrames();
+  l.splice(curFrame + 1, 0, l[curFrame].map(c => [...c]));
+  curFrame += 1;
+  setFrames(l, `copied frame ${curFrame} into frame ${curFrame + 1}, now nudge it`);
+};
+$('fDel').onclick = () => {
+  const l = currentFrames();
+  if (l.length <= 1) { say('an animation needs at least one frame', 'err'); return; }
+  const gone = curFrame + 1;
+  l.splice(curFrame, 1);
+  curFrame = clamp(curFrame, 0, l.length - 1);
+  setFrames(l, `deleted frame ${gone}`);
+};
+$('fLeft').onclick = () => {
+  if (curFrame === 0) { say('frame 1 is already first', 'err'); return; }
+  const l = currentFrames();
+  [l[curFrame - 1], l[curFrame]] = [l[curFrame], l[curFrame - 1]];
+  curFrame -= 1;
+  setFrames(l, `moved it to frame ${curFrame + 1}`);
+};
+$('fRight').onclick = () => {
+  const l = currentFrames();
+  if (curFrame >= l.length - 1) { say(`frame ${l.length} is already last`, 'err'); return; }
+  [l[curFrame + 1], l[curFrame]] = [l[curFrame], l[curFrame + 1]];
+  curFrame += 1;
+  setFrames(l, `moved it to frame ${curFrame + 1}`);
+};
+$('fWipe').onclick = () => {
+  const l = currentFrames();
+  l[curFrame] = blankFrame(regionW);
+  setFrames(l, `blanked frame ${curFrame + 1}`);
+};
+
+function setFrameCount(n) {
+  n = clamp(Math.round(n) || 1, 1, maxFrames());
+  const l = currentFrames();
+  if (n === l.length) { syncScrollUI(); return; }
+  if (n > l.length) {
+    while (l.length < n) l.push(blankFrame(regionW));
+    curFrame = n - 1;
+    setFrames(l, `now ${n} frames`);
+  } else {
+    const lost = l.length - n;
+    l.length = n;
+    curFrame = clamp(curFrame, 0, n - 1);
+    setFrames(l);
+    say(`now ${n} frames, ${lost} taken off the end`, 'err');
+  }
+}
+$('fPlus').onclick = () => setFrameCount(frameCount() + 1);
+$('fMinus').onclick = () => setFrameCount(frameCount() - 1);
+$('fcount').onchange = () => setFrameCount(parseInt($('fcount').value, 10));
+
+// Arrow keys step frames, but never while a number box has focus: the same keys
+// belong to the box then.
+addEventListener('keydown', e => {
+  if (!animMode || e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;
+  if (e.key === 'ArrowLeft') { selectFrame(curFrame - 1); e.preventDefault(); }
+  else if (e.key === 'ArrowRight') { selectFrame(curFrame + 1); e.preventDefault(); }
+});
+
+// Entering animation mode locks the three settings that would otherwise have to
+// be got right by hand: width becomes whole frames, gap becomes 0 so one frame
+// butts straight onto the next, and step becomes the region width so an update
+// advances exactly one frame. Leaving it hands them back.
+function setAnimMode(on, desiredN) {
+  animMode = !!on;
+  if (animMode) {
+    scrollOn = true;
+    scrollDir = 'left';
+    $('gap').value = 0;
+    const cap = maxFrames();
+    const n = clamp(desiredN != null ? desiredN
+      : (W > regionW ? Math.ceil(W / regionW) : 4), 1, cap);
+    const l = sliceFrames(regionW, W, px);
+    while (l.length < n) l.push(blankFrame(regionW));
+    l.length = n;
+    curFrame = clamp(curFrame, 0, n - 1);
+    t0 = performance.now();
+    writeFrames(l, regionW);
+    frameIntoView();
+  } else {
+    $('gap').value = LIM.gapDefault;
+    $('stp').value = clamp(parseInt($('stp').value, 10) || LIM.stepDefault, LIM.stepMin, LIM.stepMax);
+    buildGrid();
+  }
+  $('aScroll').classList.toggle('on', !animMode);
+  $('aAnim').classList.toggle('on', animMode);
+  $('animBar').style.display = animMode ? '' : 'none';
+  $('rowWidth').style.display = animMode ? 'none' : '';
+  $('rowFrames').style.display = animMode ? '' : 'none';
+  $('rowDir').style.display = animMode ? 'none' : '';
+  $('lblStep').style.display = animMode ? 'none' : '';
+  $('stepPair').style.display = animMode ? 'none' : '';
+  $('animStep').style.display = animMode ? '' : 'none';
+  $('pvNow').style.display = animMode ? '' : 'none';
+  // In animation mode the scroll is not optional, it IS the animation, so the
+  // on/off toggle would be a control with one legal setting. The mode buttons
+  // above already say which of the two this is.
+  $('lblTicker').style.display = animMode ? 'none' : '';
+  $('scrollOn').style.display = animMode ? 'none' : '';
+  $('lblSpeed').textContent = animMode ? 'Frame rate' : 'Speed';
+  $('spdUnit').textContent = animMode ? 'frames/sec' : 'updates/sec';
+  $('fill').textContent = animMode ? 'Fill all frames' : 'Fill all';
+  $('clear').textContent = animMode ? 'Clear all frames' : 'Clear';
+  syncScrollUI();
+}
+$('aScroll').onclick = () => { if (animMode) setAnimMode(false); };
+$('aAnim').onclick = () => { if (!animMode) setAnimMode(true); };
 
 // ---- scroll settings -----------------------------------------------------
 
@@ -349,25 +705,53 @@ const LIM = {
 let staleLimits = false;
 
 const speedVal = () => clamp(parseFloat($('spd').value) || LIM.speedDefault, LIM.speedMin, LIM.speedMax);
-const stepVal  = () => clamp(parseInt($('stp').value, 10) || LIM.stepDefault, LIM.stepMin, LIM.stepMax);
-const gapVal   = () => clamp(parseInt($('gap').value, 10) || 0, LIM.gapMin, LIM.gapMax);
+// In animation mode the step is not a preference: it is the region width, which
+// is what makes one update advance exactly one frame. It is deliberately NOT
+// clamped to the server's step ceiling here, because a clamped step would be a
+// scroll pretending to be an animation. If the running server still caps step at
+// 8 that is reported as pending rather than worked around.
+const stepVal  = () => animMode ? regionW
+  : clamp(parseInt($('stp').value, 10) || LIM.stepDefault, LIM.stepMin, LIM.stepMax);
+const gapVal   = () => animMode ? 0 : clamp(parseInt($('gap').value, 10) || 0, LIM.gapMin, LIM.gapMax);
+// True when this clyde-server predates the full-frame step. Named, never routed
+// around: the value that goes out is still the honest one.
+const stepPending = () => animMode && stepCeiling() < regionW;
 
 function scrollPayload() {
   if (!scrollOn) return null;
   return { speed: speedVal(), step: stepVal(), dir: scrollDir, gap: gapVal(), loop: true };
 }
 
+// A saved animation comes back as what it always was, a wide canvas with a
+// scroll on it, so it is recognised by its shape: gap 0, a width that is a whole
+// number of panel widths, and a step of one panel width. The second half of that
+// last test allows for a server that clamped the step on the way in, which is
+// the state of the running build until the step change lands.
+function looksAnimated(s, st, gp) {
+  if (!s || gp !== 0 || W <= regionW || W % regionW !== 0) return false;
+  return st === regionW || (stepCeiling() < regionW && st === stepCeiling());
+}
+
 function applyScroll(s) {
-  if (!s) { scrollOn = false; syncScrollUI(); return; }
+  if (!s) {
+    if (animMode) setAnimMode(false);
+    scrollOn = false; syncScrollUI(); return;
+  }
   scrollOn = true;
   scrollDir = s.dir === 'right' ? 'right' : 'left';
   const sp = parseFloat(s.speed);
   $('spd').value = round2(clamp(Number.isFinite(sp) ? sp : LIM.speedDefault, LIM.speedMin, LIM.speedMax));
-  const st = parseInt(s.step, 10);
-  $('stp').value = clamp(Number.isFinite(st) ? st : LIM.stepDefault, LIM.stepMin, LIM.stepMax);
-  $('gap').value = clamp(s.gap == null ? LIM.gapDefault : parseInt(s.gap, 10), LIM.gapMin, LIM.gapMax);
+  const stRaw = parseInt(s.step, 10);
+  const st = Number.isFinite(stRaw) ? stRaw : LIM.stepDefault;
+  const gp = clamp(s.gap == null ? LIM.gapDefault : parseInt(s.gap, 10) || 0, 0, LIM.gapMax);
+  const anim = looksAnimated(s, st, gp);
+  $('stp').value = clamp(st, LIM.stepMin, LIM.stepMax);
+  $('gap').value = anim ? 0 : gp;
   t0 = performance.now();
-  syncScrollUI();
+  if (anim) { curFrame = 0; setAnimMode(true, Math.round(W / regionW)); }
+  else if (animMode) setAnimMode(false);
+  else syncScrollUI();
+  return anim ? { frames: Math.round(W / regionW), step: st } : null;
 }
 
 const round2 = v => Math.round(v * 100) / 100;
@@ -450,13 +834,40 @@ function syncScrollUI() {
   $('dirL').classList.toggle('on', scrollDir === 'left');
   $('dirR').classList.toggle('on', scrollDir === 'right');
   for (const id of ['spd','stp','gap','dirL','dirR']) $(id).disabled = !scrollOn;
-  $('capNote').innerHTML = 'The cube accepts about <b>60 commands a minute</b>, and past that '
-    + 'the panel freezes on its last frame instead of scrolling faster, so speed stops at '
-    + round2(LIM.speedMax) + ` update${LIM.speedMax === 1 ? '' : 's'} a second. `
-    + 'Step is how far each update moves: 4 columns is one character.'
-    + (staleLimits
-        ? ' <b>This server is an older build</b> that still advertises the old limits and will refuse a step, so restart it before sending.'
-        : '');
+  // In animation mode the three locked settings are shown, not editable: a step
+  // or a gap typed in by hand is exactly what turns an animation back into a
+  // scroll that straddles two frames.
+  if (animMode) {
+    for (const id of ['stp','gap','dirL','dirR','scrollOn']) $(id).disabled = true;
+    $('animStep').textContent = `steps a whole frame, ${regionW} cols, gap 0`;
+    $('fcount').max = maxFrames();
+    if (String(frameCount()) !== $('fcount').value) $('fcount').value = frameCount();
+    $('fcVal').textContent = `${frameCount()} x ${regionW} = ${W} cols, up to ${maxFrames()} frames here`;
+  } else {
+    $('scrollOn').disabled = false;
+  }
+  $('capNote').innerHTML = animMode
+    ? ('The cube accepts about <b>60 commands a minute</b>, so an animation runs at about '
+       + '<b>one frame a second</b>. That is a slideshow rather than motion, and the hardware '
+       + 'cannot do better: past that the panel simply freezes on its last frame. '
+       + `At ${round2(speedVal())} frames a second this loop spends about `
+       + `<b>${Math.round(speedVal() * 60)} commands a minute</b>, and the status light still needs some of its own.`
+       + (stepPending()
+          ? ` <b>This clyde-server still caps step at ${stepCeiling()} columns</b>, so a full ${regionW} column frame step is pending its restart; it will clamp and scroll instead of flipping.`
+          : ''))
+    : ('The cube accepts about <b>60 commands a minute</b>, and past that '
+       + 'the panel freezes on its last frame instead of scrolling faster, so speed stops at '
+       + round2(LIM.speedMax) + ` update${LIM.speedMax === 1 ? '' : 's'} a second. `
+       + 'Step is how far each update moves: 4 columns is one character.'
+       + (staleLimits
+           ? ' <b>This server is an older build</b> that still advertises the old limits and will refuse a step, so restart it before sending.'
+           : ''));
+  if (animMode) {
+    $('animHelp').innerHTML =
+      `Frame <b>${curFrame + 1}</b> of <b>${frameCount()}</b> is the bright one, and it is the one you are drawing. `
+      + 'Click a thumbnail or use the arrow keys to move between frames. '
+      + '<b>Duplicate</b> then nudge is the quickest way to make one.';
+  }
   const cw = $('cw');
   cw.min = regionW; cw.max = Math.max(maxW, W, regionW);
   cw.value = W;
@@ -465,7 +876,15 @@ function syncScrollUI() {
   $('canvasSize').textContent = W > regionW
     ? `${W} x ${H}, window ${regionW}` : `${W} x ${H}`;
   const period = W + (scrollOn ? gapVal() : 0);
-  if (scrollOn) {
+  if (animMode) {
+    const sp = speedVal(), n = frameCount();
+    const per = sp === 1 ? 'one per second' : `one every ${secs(1 / sp)}`;
+    $('pvInfo').textContent = `${n} frame${n === 1 ? '' : 's'}, ${per}, ${secs(n / sp)} per loop`;
+    $('pvDetail').textContent =
+      `${regionW} x ${H} a frame, ${W} columns of canvas in all · steps a whole frame each update, gap 0 · `
+      + `about ${Math.round(sp * 60)} commands a minute`
+      + (stepPending() ? ` · full-frame step pending a server restart, this one caps it at ${stepCeiling()}` : '');
+  } else if (scrollOn) {
     const sp = speedVal(), st = stepVal();
     // A loop is however many updates it takes to walk the whole period. It does
     // not divide evenly at every step, and the ceiling is the honest answer:
@@ -483,9 +902,11 @@ function syncScrollUI() {
       : `${W} x ${H} fits the panel exactly, nothing to scroll`;
     $('pvDetail').textContent = '';
   }
-  $('pvNote').textContent = scrollOn
-    ? 'Top: what the panel shows, stepping at the real rate. Bottom: the whole canvas, with the panel window marked.'
-    : 'Turn Scroll on to walk the panel window across a wider canvas.';
+  $('pvNote').textContent = animMode
+    ? 'Top: the panel, playing the animation at the real rate. Bottom: every frame in a row, with the one on the panel marked.'
+    : scrollOn
+      ? 'Top: what the panel shows, stepping at the real rate. Bottom: the whole canvas, with the panel window marked.'
+      : 'Turn Scroll on to walk the panel window across a wider canvas.';
   sizePreview();
   pvDirty = true;
 }
@@ -602,6 +1023,12 @@ function drawStrip(offset) {
       ctx.fillRect(pad + x*cell, pad + y*row, Math.max(cell, 1), row);
     }
   }
+  // Where one frame ends and the next begins. Without these the strip is one
+  // long drawing again, which is the confusion animation mode exists to remove.
+  if (animMode) {
+    ctx.fillStyle = '#3a4150';
+    for (let i = 1; i < frameCount(); i++) ctx.fillRect(pad + i * regionW * cell, pad, 1, H * row);
+  }
   // The window, drawn in two pieces when it straddles the wrap.
   ctx.strokeStyle = 'rgba(255,112,0,.95)';
   ctx.lineWidth = 2;
@@ -613,9 +1040,20 @@ function drawStrip(offset) {
 function tick() {
   const o = offsetNow();
   if (pvDirty || o !== lastOffset) {
+    const moved = o !== lastOffset;
     lastOffset = o; pvDirty = false;
     drawWindow(o); drawStrip(o);
+    // Which frame is on the panel RIGHT NOW. It changes once a second at most,
+    // so writing it here costs nothing and answers the question the preview
+    // otherwise leaves the eye to count out.
+    if (animMode && moved) {
+      const n = frameCount(), i = Math.floor(o / regionW) % n;
+      $('pvNow').textContent = `showing frame ${i + 1} of ${n}`;
+    }
   }
+  // Thumbnails follow the pen, but only the frame being drawn into and only
+  // once per changed batch rather than once per pixel.
+  if (thumbDirty) { thumbDirty = false; if (animMode) drawThumb(curFrame); }
   requestAnimationFrame(tick);
 }
 requestAnimationFrame(tick);
@@ -654,6 +1092,22 @@ function readAnimating(l) {
 function setRegion(w, h) {
   const wasFit = (W === regionW);
   const changed = (w !== regionW || h !== H);
+  // An animation is N copies of the panel slice, so a slice that changes size
+  // re-lays every frame at the new width. Each frame is cropped or padded rather
+  // than stretched, and the count is kept unless the new width cannot fit it.
+  if (animMode && w !== regionW && h === H) {
+    const old = regionW;
+    regionW = w;
+    const l = sliceFrames(old, W, px).map(f => reflowFrame(f, old, w));
+    const cap = maxFrames();
+    const trimmed = l.length > cap;
+    if (trimmed) l.length = cap;
+    curFrame = clamp(curFrame, 0, l.length - 1);
+    writeFrames(l, w);
+    frameIntoView();
+    if (trimmed) say(`the panel slice changed, so the animation was cut to ${cap} frames to stay inside 256 columns`, 'err');
+    return;
+  }
   regionW = w;
   const nw = (wasFit || W < w) ? w : W;
   if (nw !== W || h !== H) resize(nw, h);
@@ -970,10 +1424,13 @@ $('send').onclick = async () => {
     }
     const notes = (d.notes || []).join('; ');
     const anim = d.animation && d.animation.running === false ? ', but nothing is animating it yet' : '';
-    say((sc
-      ? `on the cube as a scrolling ${d.mode} drawing, ${stepPhrase(sc.step)} every ${secs(1 / sc.speed)} ${sc.dir}${anim}`
-      : `on the cube as a ${d.mode} drawing`) + (notes ? ` (${notes})` : ''),
-      anim ? 'err' : 'ok');
+    const n = frameCount();
+    say((animMode
+      ? `on the cube as a ${d.mode} animation, ${n} frame${n === 1 ? '' : 's'}, one every ${secs(1 / sc.speed)}, ${secs(n / sc.speed)} a loop${anim}`
+      : sc
+        ? `on the cube as a scrolling ${d.mode} drawing, ${stepPhrase(sc.step)} every ${secs(1 / sc.speed)} ${sc.dir}${anim}`
+        : `on the cube as a ${d.mode} drawing`) + (notes ? ` (${notes})` : ''),
+      anim || (animMode && notes && /step/i.test(notes)) ? 'err' : 'ok');
     loadLayout();
   } catch (e) { say('failed: ' + e, 'err'); }
 };
@@ -988,6 +1445,22 @@ $('revert').onclick = async () => {
 
 // ---- frames --------------------------------------------------------------
 
+// What a saved frame IS, from its shape. A frame whose gap is 0 and whose width
+// is a whole number of steps is an animation of that many frames.
+// THE FLOOR OF 9 IS NOT COSMETIC. A step of 8 or less is also a legal ticker
+// step, and it is what an older server clamps a full-frame step down to, so a
+// file carrying one cannot be told apart from a character ticker by its shape
+// alone. It is called a scroll here, which is exactly what the file says it is.
+// The Load button does not rely on this: it tests the step against the region
+// this mode paints into, which is the answer that decides how it opens.
+function frameKind(f) {
+  const s = f.scroll;
+  if (!s) return '';
+  const st = Number(s.step), gp = Number(s.gap), w = Number(f.w);
+  if (gp === 0 && st > 8 && w % st === 0 && w / st >= 2) return ` · ${w / st} frames`;
+  return ' · scrolls';
+}
+
 async function loadFrames() {
   const box = $('frames');
   try {
@@ -996,15 +1469,24 @@ async function loadFrames() {
     if (!d.frames.length) { box.innerHTML = '<small style="color:var(--dim)">none saved yet</small>'; return; }
     for (const f of d.frames) {
       const row = document.createElement('div'); row.className = 'f';
-      row.innerHTML = `<span>${f.name} <small>${f.w}x${f.h}${f.scroll ? ' · scrolls' : ''}</small></span>`;
+      row.innerHTML = `<span>${f.name} <small>${f.w}x${f.h}${frameKind(f)}</small></span>`;
       const load = document.createElement('button'); load.textContent = 'Load';
       load.onclick = async () => {
         const fr = await (await fetch(API + '/api/frames/' + encodeURIComponent(f.name))).json();
         if (fr.w !== W || fr.h !== H) resize(fr.w, fr.h);
         px = fr.pixels.map(p => [...p]); paintAll();
-        applyScroll(fr.scroll || null);
+        // applyScroll owns the animation test, because it is the only place that
+        // knows the region this mode paints into. It says so on the way out.
+        const anim = applyScroll(fr.scroll || null);
         if (fr.h !== H) {
           say(`loaded at ${fr.w}x${fr.h}, which is a different height to this panel, so redraw before sending`, 'err');
+        } else if (anim) {
+          const pend = anim.step !== regionW;
+          say(`loaded ${fr.name} as an animation, ${anim.frames} frames of ${regionW} columns`
+              + (pend
+                  ? `, but its step came back as ${anim.step} rather than the ${regionW} a whole frame needs, which is the server clamp that is still pending. If this was meant to be a ticker, switch back to Scrolling ticker.`
+                  : ''),
+            pend ? 'err' : 'ok');
         } else if (fr.w > regionW && !fr.scroll) {
           say(`loaded ${fr.name} at ${fr.w} wide, which is wider than the ${regionW}-wide panel; turn Scroll on or the extra columns are clipped`, 'err');
         } else if (fr.w < regionW) {
@@ -1057,7 +1539,19 @@ $('save').onclick = async () => {
       ? '. This clyde-server predates the step control, so restart it and save again.' : ''), 'err');
     return;
   }
-  say(`saved ${name}${sc ? ' with its scroll settings' : ''}`, 'ok');
+  // The server echoes what it actually stored. An older build does not, so the
+  // known-stale ceiling stands in rather than the save reporting a clean round
+  // trip it cannot vouch for.
+  const savedStep = (d.scroll || {}).step;
+  const shownStep = savedStep != null ? savedStep : stepCeiling();
+  const clamped = animMode && (savedStep != null ? Number(savedStep) !== regionW : stepPending());
+  say(animMode
+      ? `saved ${name} as an animation, ${frameCount()} frames of ${regionW} columns`
+        + (clamped
+            ? `, but the server stored its step as ${shownStep} rather than ${regionW}: the full-frame step is still pending its restart`
+            : '')
+      : `saved ${name}${sc ? ' with its scroll settings' : ''}`,
+    clamped ? 'err' : 'ok');
   $('fname').value = ''; loadFrames();
 };
 

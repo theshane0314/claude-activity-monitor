@@ -42,7 +42,10 @@
 # "Working" includes backgrounded commands. A session that launches a test suite
 # with run_in_background and then ends its turn fires Stop, but the suite is
 # still running and the light must stay yellow until it finishes. See
-# Get-RunningTasks for how that is detected.
+# Get-RunningTasks for how that is detected, and $TaskOrphanQuietHours for the
+# one case where a held file is NOT believed: a process orphaned by a dead
+# session can hold its output file open for hours, and did, pinning a stopped
+# session's block on the panel with no slot file to delete.
 #
 # On a state CHANGE the bulb flashes the new colour a few times, so the change
 # is noticeable when other lights are on. A repeat of the current state does
@@ -133,6 +136,15 @@
 # the panel within seconds. So an update moves `step` columns (4 by default, one
 # character of a 3-wide font plus its spacing) and updates land less than once a
 # second. See the scroll configuration block for the measurements.
+#
+# A SHORT ANIMATION IS THE SAME MECHANISM, not a second player. An animation is
+# a scroll whose step is a WHOLE REGION: a canvas of N region-widths with gap 0
+# shows frame 0, then frame 1, and wraps back to frame 0. Nothing else changes,
+# so pinning, the budget limiter, the quota probe and connection rotation all
+# apply, because it IS a scrolling override. The step ceiling is therefore the
+# region width, computed per override rather than typed in: a takeover steps by
+# the panel, a session drawing by its own share. At the 1 update/second ceiling
+# that is a slideshow, not motion, and a 10 frame loop takes 10 seconds.
 #
 # The scroll is driven by the `animate` verb, a resident loop that holds ONE
 # connection open and pushes frames at the scroll rate (arming and pushing must
@@ -273,6 +285,49 @@ $TaskCacheFile = Join-Path $env:TEMP 'claude-status-light.tasks'
 # backgrounded command, but that is the trade being made.
 $TaskScanMaxAgeHours = 24
 
+# THE GHOST TASK HORIZON. A locked .output file is normally proof that a command
+# is running, and the bound above is the only thing that ever stopped believing
+# it. On 2026-09-08 a file last written SIX HOURS earlier, held by a process
+# nobody could name, pinned a stopped session's yellow block on the panel with no
+# slot file to delete and nothing short of the 24h bound to release it.
+#
+# THE FIX IS NOT A SHORTER HORIZON, and that is the important part. The bound
+# deliberately uses the NEWER of write and creation time because a quiet task (a
+# long suite that prints nothing) has a stale mtime and a fresh creation time,
+# and a shorter window would drop it while it was genuinely running. That was a
+# deliberate fix and undoing it re-opens a closed bug.
+#
+# So the ORPHAN is targeted instead, and only where THREE independent silences
+# line up. A locked file counts as a running task unless ALL of these hold:
+#
+#   1. its session has no slot file, so nothing on the panel belongs to it;
+#   2. the session has fired no hook within this window (see Update-SessionHook,
+#      whose ledger outlives both SessionEnd and the staleness sweep, which is
+#      the entire reason it is written separately from the slot);
+#   3. the .output file itself has not been touched within this window either.
+#
+# FOUR HOURS, and the number is borrowed rather than invented: it is
+# $StaleMinutesActive (240) in different units, which is already this script's
+# answer to "how long may a session be silent and still be believed to be
+# working". Past that its own slot has already been swept as dead, so going on
+# to believe its task file is live would contradict a decision this script has
+# already made. The observed ghost was six hours cold, comfortably past it.
+#
+# THE ERROR IS DELIBERATELY BIASED TOWARD KEEPING THE BLOCK. Wrongly calling a
+# live session idle is the worse failure and has happened here before: a working
+# session went green because an access-denied was read as "not running". So the
+# three conditions are ANDed, not ORed; anything unknown counts as running; and
+# a single hook from that session clears the verdict instantly. What is left is
+# a narrow residual, stated rather than hidden: a background command that runs
+# past four hours, prints nothing in that time, AND whose session fires no hook
+# in that time will be dropped from the panel while it is still running.
+$TaskOrphanQuietHours = 4
+
+# Why the last Get-RunningTasks scan discounted a locked file, so `status` can
+# explain a block that is NOT on the panel. Populated per scan, never persisted:
+# a stale reason is worse than no reason.
+$script:TaskOrphans = New-Object System.Collections.Generic.List[string]
+
 # `prune` deletes task .output files older than this. Claude Code already cleans
 # up at about 7 days on its own, so this is a BACKSTOP for when that fails, not
 # the primary mechanism, and it deliberately does not shorten that retention.
@@ -321,6 +376,18 @@ $ScrollMinSpeed = 0.05      # one update every 20s, the slowest worth having
 $ScrollMaxSpeed = 1.0       # above this the panel freezes; the clamp is the hardware
 $ScrollDefaultStep = 4      # columns moved per update: one 3-wide char plus spacing
 $ScrollMinStep = 1
+
+# A FLOOR UNDER THE CEILING, NOT THE CEILING. The real ceiling is the width of
+# the region the drawing lands in, computed per override in Get-ScrollSpec, and
+# this is only the point below which the region never drags it: a step of 8 goes
+# on being accepted in a 4-wide session share exactly as it always was.
+#
+# The region width is what makes a SHORT ANIMATION work without a second player.
+# A canvas of N region-widths, gap 0, stepped a whole region per update, shows
+# frame 0, frame 1, ... and wraps: pinning, the budget limiter, the quota probe
+# and connection rotation all apply because it IS a scrolling override. At the
+# 1 update/second ceiling that is a slideshow, not motion, and the hardware
+# cannot do better: a 10 frame loop takes 10 seconds.
 $ScrollMaxStep = 8
 $ScrollDefaultGap = 8       # blank columns between the tail and the head
 $ScrollMinGap = 0
@@ -645,6 +712,61 @@ function Get-Spans {
     return , $spans
 }
 
+function Get-RegionSplit {
+    # WHERE A share/total SPLIT PUTS THE TWO REGIONS, in panel columns.
+    #
+    # THE ONLY COPY OF THIS ARITHMETIC. Three places need it and they must never
+    # disagree: Get-MatrixFrame paints with it, Get-ScrollSpec clamps `step`
+    # against it, and the `layout` verb quotes it to the editor. A second copy
+    # would drift, and the copy that drifted would step an animation across the
+    # region boundary and smear two frames together without anything failing:
+    # the panel is write-only, so nothing downstream could notice.
+    #
+    # Returns raw (possibly non-integer) widths, exactly as Get-Spans produces
+    # them, because the layout verb has always published them that way.
+    param([int]$Total, [int]$Share)
+
+    if ($Total -lt 2) { $Total = 2 }
+    if ($Share -lt 1) { $Share = 1 }
+    if ($Share -ge $Total) { $Share = $Total - 1 }
+
+    $parts = Get-Spans -Count $Total -Total $MatrixW
+    $sesParts = $Total - $Share
+    $sesX0 = $parts[0][0]
+    $sesW = ($parts[$sesParts - 1][0] + $parts[$sesParts - 1][1]) - $sesX0
+    $drawX0 = $parts[$sesParts][0]
+    $drawX1 = $parts[$Total - 1][0] + $parts[$Total - 1][1] - 1
+
+    return [pscustomobject]@{
+        DrawX0     = $drawX0
+        DrawX1     = $drawX1
+        DrawW      = ($drawX1 - $drawX0 + 1)
+        SessionsX0 = $sesX0
+        SessionsW  = $sesW
+    }
+}
+
+function Get-OverrideRegion {
+    # The same answer for an override object: where ITS drawing lands and how
+    # much width the real sessions are left. A takeover (and no override at all)
+    # owns the whole panel, so both regions are the panel.
+    param($Ov)
+
+    $mode = $null
+    if ($null -ne $Ov) { try { $mode = [string]$Ov.mode } catch { } }
+    if ($mode -ne 'session') {
+        return [pscustomobject]@{
+            DrawX0 = 0; DrawX1 = ($MatrixW - 1); DrawW = $MatrixW
+            SessionsX0 = 0; SessionsW = $MatrixW
+        }
+    }
+
+    $total = 0; $share = 0
+    try { $total = [int]$Ov.total } catch { }
+    try { $share = [int]$Ov.share } catch { }
+    return (Get-RegionSplit -Total $total -Share $share)
+}
+
 function Get-ScrollSpec {
     # The override's optional `scroll` block, clamped, or $null when it is absent
     # or unusable.
@@ -682,8 +804,22 @@ function Get-ScrollSpec {
 
     if ($speed -lt $ScrollMinSpeed) { $speed = [double]$ScrollMinSpeed }
     if ($speed -gt $ScrollMaxSpeed) { $speed = [double]$ScrollMaxSpeed }
+
+    # THE STEP CEILING IS THE REGION WIDTH, AND IT IS COMPUTED RATHER THAN TYPED.
+    # An animation is not a second feature: it is a scroll whose step is a whole
+    # region, so a canvas of N region-widths with gap 0 shows frame 0, frame 1,
+    # ... and wraps back to frame 0. A hardcoded 20 would be right for a takeover
+    # and wrong for a session drawing, which steps by ITS share of the width; a
+    # step wider than the region would walk past the boundary and show two frames
+    # at once. Get-OverrideRegion is the single copy of that arithmetic, shared
+    # with the painter, so the clamp and the blit cannot disagree.
+    #
+    # The Max() is not decoration. 1..8 has to keep behaving exactly as it does
+    # today, including inside a region NARROWER than 8 (a 1/4 share is 4 columns),
+    # so the region width raises the ceiling and never lowers it.
+    $stepMax = [int][Math]::Max([double]$ScrollMaxStep, [double](Get-OverrideRegion -Ov $Ov).DrawW)
     if ($step -lt $ScrollMinStep) { $step = $ScrollMinStep }
-    if ($step -gt $ScrollMaxStep) { $step = $ScrollMaxStep }
+    if ($step -gt $stepMax) { $step = $stepMax }
     if ($gap -lt $ScrollMinGap) { $gap = $ScrollMinGap }
     if ($gap -gt $ScrollMaxGap) { $gap = $ScrollMaxGap }
     if ($dir -ne 'right') { $dir = 'left' }
@@ -1073,26 +1209,21 @@ function Get-MatrixFrame {
     $regionX0 = 0
     $regionW = $MatrixW
     if ($null -ne $Override -and $Override.mode -eq 'session') {
-        $total = [int]$Override.total
-        $share = [int]$Override.share
-        if ($total -lt 2) { $total = 2 }
-        if ($share -lt 1) { $share = 1 }
-        if ($share -ge $total) { $share = $total - 1 }
-
-        $parts = Get-Spans -Count $total -Total $MatrixW
-        $sesParts = $total - $share
-        $regionX0 = $parts[0][0]
-        $regionW = ($parts[$sesParts - 1][0] + $parts[$sesParts - 1][1]) - $regionX0
-
-        $drawX0 = $parts[$sesParts][0]
-        $drawX1 = $parts[$total - 1][0] + $parts[$total - 1][1] - 1
+        # ONE source for the split, shared with the step clamp in Get-ScrollSpec.
+        # The clamp has to agree with the blit about how wide the drawing's
+        # region is, and the only way to guarantee that is for neither to own the
+        # arithmetic. See Get-RegionSplit.
+        $reg = Get-OverrideRegion -Ov $Override
+        $regionX0 = $reg.SessionsX0
+        $regionW = $reg.SessionsW
+        $drawX0 = $reg.DrawX0
 
         # Scrolling here is confined to the drawing's own share of the width. The
         # window is the share, NOT the rest of the panel: without an explicit
         # region the walk would run on over the sessions laid out to its left.
         if ($null -ne $scroll) {
             $ok = Set-Pixels -Buf $buf -B64 $Override.pixels -W ([int]$Override.w) -H ([int]$Override.h) `
-                -X0 $drawX0 -Y0 $top -Scroll -RegionW ($drawX1 - $drawX0 + 1) `
+                -X0 $drawX0 -Y0 $top -Scroll -RegionW ([int]$reg.DrawW) `
                 -Offset (Get-ScrollOffset -Scroll $scroll -Offset $Offset) -Gap ([int]$scroll.gap)
         }
         else {
@@ -1204,6 +1335,15 @@ function Show-Status {
     $tasks = @(Get-RunningTasks)
     if ($tasks.Count -eq 0) { "  (none)" } else { $tasks | ForEach-Object { "  $_" } }
 
+    # Read straight after that scan, before Get-Picture below can run another
+    # one. A block that is NOT on the panel is the hardest thing to explain
+    # afterwards, so the reason it was discounted is printed at the same level as
+    # the tasks that were counted.
+    if ($script:TaskOrphans.Count -gt 0) {
+        "orphan tasks (locked, but discounted; ${TaskOrphanQuietHours}h quiet window):"
+        $script:TaskOrphans | ForEach-Object { "  $_" }
+    }
+
     # Computed here, before anything reports on it, and WITHOUT -Force. An
     # earlier version forced a rescan at this point, which overwrote the busy
     # cache before Get-Picture read it: `status` then showed a different picture
@@ -1269,9 +1409,9 @@ function Show-Status {
 
         $regionW = $MatrixW
         if ($null -ne $ovs -and $ovs.mode -eq 'session') {
-            $ps = Get-Spans -Count ([int]$ovs.total) -Total $MatrixW
-            $sesParts = [int]$ovs.total - [int]$ovs.share
-            $regionW = ($ps[$sesParts - 1][0] + $ps[$sesParts - 1][1]) - $ps[0][0]
+            # Same helper the painter and the step clamp use, so `status` cannot
+            # describe a split the panel is not actually showing.
+            $regionW = (Get-OverrideRegion -Ov $ovs).SessionsW
             "display   : drawing takes $($ovs.share)/$($ovs.total) on the right ($($ovs.w)x$($ovs.h))"
             "            $n session(s) share the left ${regionW} of $MatrixW columns"
         }
@@ -1367,6 +1507,97 @@ function Set-SessionState {
     Set-Content -LiteralPath $f -Value $Want -NoNewline
 }
 
+function Get-SessionShortKey {
+    # The 8 characters every other part of this script keys a session by: the
+    # slot file's base name truncated, and the prefix Get-RunningTasks reports.
+    # One definition so the orphan check cannot key on something subtly else.
+    param([string]$Name)
+    if ([string]::IsNullOrEmpty($Name)) { return '' }
+    return $Name.Substring(0, [Math]::Min(8, $Name.Length))
+}
+
+function Update-SessionHook {
+    # A PER-SESSION RECORD OF "THIS SESSION IS ALIVE", written on every hook and
+    # kept when the slot is not.
+    #
+    # It cannot be folded into the slot file, and that is the whole point. The
+    # slot is REMOVED by SessionEnd and by Get-Picture's staleness sweep, so by
+    # the time the orphan question is being asked the only evidence that would
+    # answer it has already been deleted. This file survives both, so "no slot"
+    # and "no hook for hours" stay two separate facts instead of one fact read
+    # twice.
+    #
+    # The timestamp is what is read; the content is for a human with a text
+    # editor. Failure is swallowed: a status light must never break a hook, and a
+    # missing ledger entry only ever makes the orphan check MORE cautious.
+    param([string]$Key)
+    if ([string]::IsNullOrWhiteSpace($Key)) { return }
+    try {
+        if (-not (Test-Path -LiteralPath $StateDir)) {
+            New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+        }
+        [System.IO.File]::WriteAllText((Join-Path $StateDir ($Key + '.hook')), (Get-Date).ToString('o'))
+    }
+    catch { }
+}
+
+function Get-SessionHookIndex {
+    # Everything the orphan check needs about the sessions this script knows
+    # about, gathered in ONE directory listing rather than per task file: the
+    # short keys that currently hold a slot, and the last hook time recorded for
+    # each short key.
+    #
+    # The slot's own LastWriteTime counts as a hook time too. A session whose
+    # ledger entry predates this feature still has a slot being rewritten on
+    # every hook, so the index is never blind to a session that is plainly live.
+    $slots = @{}
+    $lastHook = @{}
+    foreach ($f in @(Get-ChildItem -LiteralPath $StateDir -File -ErrorAction SilentlyContinue)) {
+        $k = Get-SessionShortKey $f.BaseName
+        if ($k -eq '') { continue }
+        if ($f.Extension -eq '.state') { $slots[$k] = $true }
+        elseif ($f.Extension -ne '.hook') { continue }
+        if (-not $lastHook.ContainsKey($k) -or $f.LastWriteTime -gt $lastHook[$k]) {
+            $lastHook[$k] = $f.LastWriteTime
+        }
+    }
+    return [pscustomobject]@{ Slots = $slots; LastHook = $lastHook }
+}
+
+function Test-TaskOrphan {
+    # $true when a LOCKED task file is held by something that is not a live
+    # session. Three silences have to agree; see $TaskOrphanQuietHours for why,
+    # and for which way this is deliberately wrong when it is wrong.
+    #
+    # Hands back the reason as well as the verdict, because a block missing from
+    # the panel is exactly the kind of decision that is unfalsifiable after the
+    # fact unless it says why at the time.
+    param([string]$ShortKey, [datetime]$FileNewest, $Index, [datetime]$Cut)
+
+    if ($Index.Slots.ContainsKey($ShortKey)) {
+        return [pscustomobject]@{ Orphan = $false; Reason = 'session has a live slot' }
+    }
+    if ($FileNewest -ge $Cut) {
+        return [pscustomobject]@{ Orphan = $false; Reason = 'output file touched inside the quiet window' }
+    }
+    if ($Index.LastHook.ContainsKey($ShortKey) -and $Index.LastHook[$ShortKey] -ge $Cut) {
+        return [pscustomobject]@{ Orphan = $false; Reason = 'session fired a hook inside the quiet window' }
+    }
+
+    # Both branches name the HOOK evidence explicitly, because "no record" and
+    # "an old record" are different facts and a reader has to be able to tell
+    # which one is being relied on.
+    $hookAge = 'no hook ever seen by this script'
+    if ($Index.LastHook.ContainsKey($ShortKey)) {
+        $hookAge = '{0:n1}h since its last hook' -f ((Get-Date) - $Index.LastHook[$ShortKey]).TotalHours
+    }
+    return [pscustomobject]@{
+        Orphan = $true
+        Reason = ('no slot, {0}, output cold for {1:n1}h (>{2}h)' -f `
+                $hookAge, ((Get-Date) - $FileNewest).TotalHours, $TaskOrphanQuietHours)
+    }
+}
+
 function Get-RunningTasks {
     # Claude Code gives every backgrounded command a task id and streams its
     # output to %TEMP%\claude\<project>\<session>\tasks\<id>.output, holding that
@@ -1384,12 +1615,24 @@ function Get-RunningTasks {
     # outlives the turn that started it and can outlive the slot's staleness
     # sweep. Files older than $TaskScanMaxAgeHours are skipped without being
     # opened, which is most of them.
+    #
+    # A LOCK IS NOT QUITE PROOF, though it very nearly is. A file held by an
+    # orphaned process is indistinguishable from a running command by the lock
+    # alone, and pinned a stopped session's block on the panel for hours. The one
+    # case that is discounted is set out at $TaskOrphanQuietHours: no slot, no
+    # hook, and no write, all three, for four hours. Everything else still
+    # counts, including anything the check cannot form an opinion about.
     param([switch]$StopAtFirst)
 
     $found = New-Object System.Collections.Generic.List[string]
+    # Reset per scan, so `status` can never quote a reason from a scan that has
+    # since been superseded.
+    $script:TaskOrphans = New-Object System.Collections.Generic.List[string]
     $root = Join-Path $env:TEMP 'claude'
     if (-not (Test-Path -LiteralPath $root)) { return $found }
     $cut = (Get-Date).AddHours(-$TaskScanMaxAgeHours)
+    $orphanCut = (Get-Date).AddHours(-$TaskOrphanQuietHours)
+    $index = Get-SessionHookIndex
 
     foreach ($proj in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
         foreach ($sess in @(Get-ChildItem -LiteralPath $proj.FullName -Directory -ErrorAction SilentlyContinue)) {
@@ -1425,7 +1668,19 @@ function Get-RunningTasks {
                 catch { }
 
                 if ($locked) {
-                    $found.Add(($sess.Name.Substring(0, [Math]::Min(8, $sess.Name.Length))) + '/' + $f.BaseName)
+                    # THE ORPHAN CHECK RUNS ONLY ON A FILE THAT IS ACTUALLY HELD,
+                    # after the open and not before it. Testing first would be
+                    # cheaper, but it would also name files that are simply old
+                    # and unlocked as orphans, and a reason that is not about a
+                    # real lock is a reason that misleads whoever reads it.
+                    $short = Get-SessionShortKey $sess.Name
+                    $verdict = Test-TaskOrphan -ShortKey $short -FileNewest $newest -Index $index -Cut $orphanCut
+                    if ($verdict.Orphan) {
+                        $script:TaskOrphans.Add(($short + '/' + $f.BaseName + '  ' + $verdict.Reason))
+                        Write-Trace ("tasks: ignoring orphan $short/$($f.BaseName) - " + $verdict.Reason)
+                        continue
+                    }
+                    $found.Add($short + '/' + $f.BaseName)
                     if ($StopAtFirst) { return $found }
                 }
             }
@@ -1683,13 +1938,19 @@ if ($State -eq 'layout') {
                     if ($seen.ContainsKey($key)) { continue }
                     $seen[$key] = $true
 
-                    $ps = Get-Spans -Count $t -Total $MatrixW
-                    $x0 = $ps[$t - $sh][0]
-                    $x1 = $ps[$t - 1][0] + $ps[$t - 1][1] - 1
+                    # The SAME split arithmetic the painter and the step clamp
+                    # use. This loop used to carry its own copy, which is exactly
+                    # the drift the single helper exists to prevent.
+                    $rs = Get-RegionSplit -Total $t -Share $sh
                     [pscustomobject]@{
-                        share = $sh; total = $t; w = ($x1 - $x0 + 1); h = $avail
+                        share = $sh; total = $t; w = $rs.DrawW; h = $avail
                         label = "$sh/$t of the panel"
                         frac  = ($sh / $t)
+                        # What an ANIMATION in this split has to step by: one
+                        # whole region per update, with a canvas of N of them and
+                        # gap 0. Published per split so the editor never has to
+                        # rediscover the region width for itself.
+                        step_max = [int][Math]::Max([double]$ScrollMaxStep, [double]$rs.DrawW)
                     }
                 }
             }
@@ -1707,12 +1968,24 @@ if ($State -eq 'layout') {
         # so it can range its own controls without hardcoding them here twice.
         scroll     = $(
             $sc = Get-ScrollSpec -Ov $ov
-            if ($null -eq $sc) { $null } else { @{ speed = $sc.speed; dir = $sc.dir; gap = $sc.gap; loop = $true } }
+            if ($null -eq $sc) { $null }
+            # `step` was missing here, which left the editor unable to read back
+            # the one field an animation is defined by.
+            else { @{ speed = $sc.speed; step = $sc.step; dir = $sc.dir; gap = $sc.gap; loop = $true } }
         )
         scroll_limits = @{
             speed_min = $ScrollMinSpeed; speed_max = $ScrollMaxSpeed; speed_default = $ScrollDefaultSpeed
             gap_min   = $ScrollMinGap; gap_max = $ScrollMaxGap; gap_default = $ScrollDefaultGap
             dirs      = @('left', 'right')
+            # THE STEP CEILING IS NOT A CONSTANT, so it is reported rather than
+            # left for the editor to assume. It is the width of the region the
+            # CURRENT override lands in (the panel when there is none), because
+            # an animation steps one whole region per update. `region_w` is that
+            # width on its own, which is also the canvas width one frame needs.
+            step_min     = $ScrollMinStep
+            step_default = $ScrollDefaultStep
+            step_max     = [int][Math]::Max([double]$ScrollMaxStep, [double](Get-OverrideRegion -Ov $ov).DrawW)
+            region_w     = [int](Get-OverrideRegion -Ov $ov).DrawW
         }
         # Whether the resident loop is actually driving the panel right now.
         animating  = $(
@@ -1751,6 +2024,18 @@ if ($State -eq 'prune') {
     }
     "scanned $seen task files, older than $TaskPruneDays days: deleted $n ({0:n1} MB), skipped $skipped" -f ($bytes / 1MB)
     Write-Trace "prune: deleted $n skipped $skipped of $seen"
+
+    # The hook ledger too, on the same pass, so it cannot grow one small file per
+    # session forever. Only entries older than $TaskScanMaxAgeHours go, which is
+    # far past $TaskOrphanQuietHours: an entry that old already reads as "quiet"
+    # to the orphan check, so removing it cannot change a single verdict.
+    $hookCut = (Get-Date).AddHours(-$TaskScanMaxAgeHours)
+    $hn = 0
+    foreach ($hf in @(Get-ChildItem -LiteralPath $StateDir -Filter '*.hook' -File -ErrorAction SilentlyContinue)) {
+        if ($hf.LastWriteTime -ge $hookCut) { continue }
+        try { Remove-Item -LiteralPath $hf.FullName -Force -ErrorAction Stop; $hn++ } catch { }
+    }
+    "hook ledger: deleted $hn entr(ies) older than $TaskScanMaxAgeHours h"
     exit 0
 }
 
@@ -2149,6 +2434,11 @@ try {
         }
         else {
             Update-Activity
+            # BEFORE Set-SessionState, which retires the slot on SessionEnd. The
+            # ledger has to record that this session was here even when the slot
+            # is about to be deleted: that is the difference between "ended" and
+            # "never existed", and the orphan check reads it.
+            Update-SessionHook -Key $key
             Set-SessionState -Key $key -Want $State -HookName $hookName
             $pic = Get-Picture
             Write-Trace ("slots=[" + (($pic.Slots | ForEach-Object { $_.Key + '=' + $_.State }) -join ' ') + "] agg=" + $pic.Aggregate)
